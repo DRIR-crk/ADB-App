@@ -37,16 +37,15 @@ class OperationsState {
       return () => {};
     });
 
-    // Initialize from backend
-    invoke<OperationJob[]>('get_jobs').then((jobs) => {
-      this.jobs = jobs;
+    // Listen first: an update delivered while the initial snapshot is in flight is newer than it.
+    let updateSeen = false;
+    listen<OperationJob[]>('operations-update', (event) => {
+      updateSeen = true;
+      this.jobs = event.payload;
+    }).then(() => invoke<OperationJob[]>('get_jobs')).then((jobs) => {
+      if (!updateSeen) this.jobs = jobs;
     }).catch(error => {
       this.error = error instanceof Error ? error.message : String(error);
-    });
-
-    // Listen for updates from backend
-    listen<OperationJob[]>('operations-update', (event) => {
-      this.jobs = event.payload;
     });
   }
 

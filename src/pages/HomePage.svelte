@@ -1,12 +1,12 @@
 <script lang="ts">
   import * as m from "../paraglide/messages";
 
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, emit } from "@tauri-apps/api/event";
   import { save, open } from "@tauri-apps/plugin-dialog";
   import { getName } from "@tauri-apps/api/app";
   import { devicesState, type DeviceDetails } from "../context/devices.svelte";
+  import { sideloadState } from "../context/sideload.svelte";
   import { i18n } from "../context/i18n.svelte";
   import { themeState } from "../context/theme.svelte";
   import MaterialIcon from "../components/MaterialIcon.svelte";
@@ -33,7 +33,8 @@
   };
 
 
-  let timeNow = $state(import.meta.env.MODE === 'mock' ? new Date('2026-06-15T09:45:00') : new Date());
+  const mockNow = import.meta.env.MODE === 'mock' ? new Date('2026-06-15T09:45:00') : null;
+  let timeNow = $state(mockNow ?? new Date());
   let capturing = $state(false);
   let savingScreenshot = $state(false);
   let autoSavedScreenshotPath = $state<string | null>(null);
@@ -56,6 +57,20 @@
     if (homeIdentity?.serial !== selectedSerial) return;
     deviceName = homeIdentity.deviceName;
     carrierName = homeIdentity.carrierName;
+  });
+
+  // Per-device UI state must not leak into the next selection (or into "no device").
+  $effect(() => {
+    selectedSerial;
+    untrack(() => {
+      actionError = null;
+      shizukuError = null;
+      if (shizukuStatus !== "busy") shizukuStatus = "idle";
+      if (devicesState.homeIdentity?.serial !== selectedSerial) {
+        deviceName = appName;
+        carrierName = "";
+      }
+    });
   });
 
   function fetchDeviceNameAndCarrier(serial: string) {
@@ -107,7 +122,6 @@
 
     if (selectedSerial && selectedState === "device") {
       devicesState.refreshDeviceDetailsSilent();
-      fetchDeviceNameAndCarrier(selectedSerial);
     }
 
     const runtimeInterval = window.setInterval(() => {
@@ -147,7 +161,10 @@
 
   let bootDate = $derived.by(() => {
     if (dd && dd.uptime_seconds >= 0) {
-      const date = new Date(timeNow.getTime() - dd.uptime_seconds * 1000);
+      // Anchor to the moment the uptime sample arrived (dd changes on every poll),
+      // not to the lockscreen clock, which only ticks while the wallpaper is shown.
+      const now = mockNow ? mockNow.getTime() : Date.now();
+      const date = new Date(now - dd.uptime_seconds * 1000);
       return {
         short: date
           .toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })
@@ -256,35 +273,42 @@
   );
 
   async function captureScreenshot() {
-    if (!selectedDevice || selectedState !== "device") return;
+    if (!selectedDevice || selectedState !== "device" || capturing) return;
+    const serial = selectedDevice.serial;
     capturing = true;
     actionError = null;
     autoSavedScreenshotPath = null;
     try {
       const settings = await invoke<any>("get_app_settings");
+      if (serial !== selectedSerial) return;
       if (settings?.auto_save_screenshots) {
-        const deviceNameRaw = devicesState.homeIdentity?.deviceName || selectedDevice.device || selectedDevice.model || "Unknown";
-        
+        // The cached identity falls back to the app name when the device has no name; don't use that as a folder.
+        const identityName = devicesState.homeIdentity?.deviceName;
+        const deviceNameRaw = (identityName && identityName !== appName ? identityName : "")
+          || selectedDevice.device || selectedDevice.model || "Unknown";
+
         const fileNameBase = new Date().toISOString().replace(/[:.]/g, "-");
         const result = await invoke<{ base64: string, saved_path: string | null, save_error: string | null }>("capture_and_save_screenshot_auto", {
-          serial: selectedDevice.serial,
+          serial,
           deviceName: deviceNameRaw,
           fileNameBase: fileNameBase,
         });
+        if (serial !== selectedSerial) return;
 
         devicesState.screenshot = `data:image/png;base64,${result.base64}`;
-        
+
         if (result.save_error) {
           actionError = result.save_error;
         } else {
           autoSavedScreenshotPath = result.saved_path;
         }
       } else {
-        const base64 = await invoke<string>("capture_screenshot", { serial: selectedDevice.serial });
+        const base64 = await invoke<string>("capture_screenshot", { serial });
+        if (serial !== selectedSerial) return;
         devicesState.screenshot = `data:image/png;base64,${base64}`;
       }
     } catch (e) {
-      actionError = String(e);
+      if (serial === selectedSerial) actionError = String(e);
     } finally {
       capturing = false;
     }
@@ -295,7 +319,7 @@
     const destination = await save({
       title: m.home_saveCapture(),
       defaultPath: `${new Date().toISOString().replace(/[:.]/g, "-")}.png`,
-      filters: [{ name: "Imagen PNG", extensions: ["png"] }],
+      filters: [{ name: m.home_filter_png(), extensions: ["png"] }],
     });
     if (!destination) return;
     savingScreenshot = true;
@@ -321,7 +345,7 @@
     const destination = await save({
       title: m.home_saveWallpaper(),
       defaultPath: `adb-wallpaper-${new Date().toISOString().replace(/[:.]/g, "-")}.png`,
-      filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg"] }],
+      filters: [{ name: m.home_filter_image(), extensions: ["png", "jpg", "jpeg"] }],
     });
     if (!destination) return;
     savingScreenshot = true;
@@ -370,7 +394,7 @@
         serial: selectedDevice.serial,
         args: [
           "shell",
-          "sh /sdcard/Android/data/moe.shizuku.privileged.api/start.sh &",
+          "sh /sdcard/Android/data/moe.shizuku.privileged.api/start.sh",
         ],
       });
       shizukuStatus = "success";
@@ -384,41 +408,29 @@
     }
   }
 
-  let sideloadBusy = $state(false);
-  let sideloadProgress = $state(0);
+  // `adb sideload` is only accepted once the device reports the "sideload" state
+  // (after "Apply update from ADB" is chosen in recovery); "recovery" alone is not enough.
+  let isRecoveryLike = $derived(selectedState === "recovery" || selectedState === "sideload");
+  let canSideload = $derived(selectedState === "sideload");
+  // Sideload progress lives in a module-level store so it survives leaving this page.
+  let sideloadActive = $derived(sideloadState.busy && sideloadState.serial === selectedSerial);
+  let sideloadError = $derived(sideloadState.serial === selectedSerial ? sideloadState.error : null);
 
   async function startSideload() {
-    if (!selectedDevice || selectedState !== "recovery" || sideloadBusy) return;
+    if (!selectedDevice || !canSideload || sideloadState.busy) return;
+    const serial = selectedDevice.serial;
     actionError = null;
     const file = await open({
       multiple: false,
-      filters: [{ name: "OTA Update", extensions: ["zip"] }],
+      filters: [{ name: m.home_filter_ota(), extensions: ["zip"] }],
     });
-    if (!file) return;
+    if (!file || serial !== selectedSerial || !canSideload) return;
 
-    sideloadBusy = true;
-    sideloadProgress = 0;
-
-    const unlisten = await listen<number>("sideload-progress", (event) => {
-      sideloadProgress = event.payload;
-    });
-
-    try {
-      await invoke("sideload_device", {
-        serial: selectedDevice.serial,
-        filePath: file,
-      });
-      setTimeout(() => devicesState.refreshDevices(), 2000);
-    } catch (error) {
-      actionError = String(error);
-    } finally {
-      sideloadBusy = false;
-      unlisten();
-    }
+    await sideloadState.start(serial, file);
   }
 
   function cancelSideload() {
-    emit("cancel-sideload");
+    sideloadState.cancel();
   }
 
   async function rebootFromPreview() {
@@ -504,7 +516,7 @@
               >{shizukuError}</span
             >
           {/if}
-          {#if actionError && devicesState.selectedDevice?.state !== "recovery"}
+          {#if actionError && !isRecoveryLike}
             <span
               style="color: var(--md-sys-color-error, #f44336); font-size: 0.85rem; max-width: 250px; line-height: 1.2;"
               >{actionError}</span
@@ -563,7 +575,7 @@
               : "-"}</small
           >
           <md-linear-progress
-            value={dd?.total_ram_mb
+            value={dd && dd.total_ram_mb > 0 && dd.used_ram_mb >= 0
               ? Math.max(0, Math.min(1, dd.used_ram_mb / dd.total_ram_mb))
               : 0}
           ></md-linear-progress>
@@ -581,7 +593,7 @@
               : "-"}</small
           >
           <md-linear-progress
-            value={dd?.total_storage_mb
+            value={dd && dd.total_storage_mb > 0 && dd.used_storage_mb >= 0
               ? Math.max(
                   0,
                   Math.min(1, dd.used_storage_mb / dd.total_storage_mb),
@@ -852,7 +864,7 @@
             {/if}
           </md-filled-button>
         </div>
-      {:else if devicesState.selectedDevice.state === "recovery"}
+      {:else if isRecoveryLike}
         <div
           style="position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; padding: 16px 0; box-sizing: border-box; gap: 32px;"
         >
@@ -877,7 +889,7 @@
             <div
               style="display: flex; flex-direction: column; gap: 12px; margin-top: 32px; width: 100%; align-items: center;"
             >
-              {#if sideloadBusy}
+              {#if sideloadActive}
                 <div
                   style="width: 250px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 16px;"
                 >
@@ -885,10 +897,10 @@
                     <div
                       style="margin-bottom: 12px; font-weight: 600; font-size: 1.3rem;"
                     >
-                      {sideloadProgress}%
+                      {sideloadState.progress}%
                     </div>
                     <md-linear-progress
-                      value={sideloadProgress / 100}
+                      value={sideloadState.progress / 100}
                       style="width: 100%; height: 8px; border-radius: 4px;"
                     ></md-linear-progress>
                   </div>
@@ -900,7 +912,17 @@
                   </md-outlined-button>
                 </div>
               {:else}
-                <md-filled-button onclick={startSideload} style="width: 220px;">
+                {#if !canSideload}
+                  <span
+                    style="width: 90%; font-size: 0.85rem; opacity: 0.8; text-align: center;"
+                    >{m.home_sideload_hint_recovery()}</span
+                  >
+                {/if}
+                <md-filled-button
+                  onclick={startSideload}
+                  disabled={!canSideload || sideloadState.busy ? true : undefined}
+                  style="width: 220px;"
+                >
                   <span slot="icon"
                     ><MaterialIcon name="system_update_alt" size={18} /></span
                   >
@@ -921,12 +943,12 @@
               {/if}
             </div>
 
-            {#if actionError}
+            {#if actionError || sideloadError}
               <p
                 style="margin-top: 16px; width: 90%; font-size: 13px; color: var(--md-sys-color-error); display: flex; align-items: flex-start; gap: 6px; text-align: left; max-height: 120px; overflow-y: auto; white-space: pre-wrap; font-family: monospace; line-height: 1.4;"
               >
                 <span style="flex-shrink: 0; margin-top: 2px;"><MaterialIcon name="warning" size={16} /></span>
-                {actionError}
+                {actionError ?? sideloadError}
               </p>
             {/if}
           </div>

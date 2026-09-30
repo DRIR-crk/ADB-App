@@ -1,7 +1,7 @@
 <script lang="ts">
 import * as m from '../paraglide/messages';
 
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { devicesState } from '../context/devices.svelte';
   import { i18n, type Language } from '../context/i18n.svelte';
@@ -38,7 +38,7 @@ import * as m from '../paraglide/messages';
   let status = $state('');
   let busy = $state(false);
   let tools = $derived(toolsState.status);
-  type AppSettings = { cache_enabled: boolean; cache_path: string; kill_adb_on_exit: boolean; auto_save_screenshots: boolean; material_you_enabled: boolean; material_you_background_tint: boolean; window_effect: WindowEffectMode; theme: string; language: string; packaged?: boolean };
+  type AppSettings = { cache_enabled: boolean; cache_path: string; kill_adb_on_exit: boolean; pairing_detection: boolean; auto_save_screenshots: boolean; material_you_enabled: boolean; material_you_background_tint: boolean; window_effect: WindowEffectMode; theme: string; language: string; packaged?: boolean };
   let appSettings = $state<AppSettings | null>(null);
   let defaultCacheDir = $state('');
   let toolUpdatesChecking = $derived(toolsState.checkingUpdates);
@@ -77,6 +77,11 @@ import * as m from '../paraglide/messages';
   let cameraWidth = $state('');
   let cameraHeight = $state('');
   let cameras = $state<string[]>([]);
+  let mirrorAppsLoading = false;
+  let camerasLoading = false;
+  let mirrorDataSerial = '';
+  let syncedAdbPath = '';
+  let syncedScrcpyPath = '';
 
   async function run(args: string[], success = '') {
     if (!serial) { status = m.workbench_status_selectDevice(); return; }
@@ -104,18 +109,26 @@ import * as m from '../paraglide/messages';
     }
   }
 
-  async function refreshMirrorData() {
-    if (!serial) return;
-    if (mirrorApps.length === 0) {
+  async function refreshMirrorData(force = false) {
+    const target = serial;
+    if (!target) return;
+    if ((force || mirrorApps.length === 0) && !mirrorAppsLoading) {
+      mirrorAppsLoading = true;
       try {
-        const value = await invoke<AppSummary[]>('list_apps', { serial, forceRefresh: false });
-        mirrorApps = value.filter(app => !app.system_app);
-      } catch { mirrorApps = []; }
+        const value = await invoke<AppSummary[]>('list_apps', { serial: target, forceRefresh: false });
+        if (serial === target) mirrorApps = value.filter(app => !app.system_app);
+      } catch {
+        if (serial === target) mirrorApps = [];
+      } finally {
+        mirrorAppsLoading = false;
+      }
     }
-    if (cameras.length === 0) {
-      invoke<string[]>('list_scrcpy_cameras', { serial })
-        .then(res => cameras = res)
-        .catch(() => cameras = []);
+    if ((force || cameras.length === 0) && !camerasLoading) {
+      camerasLoading = true;
+      invoke<string[]>('list_scrcpy_cameras', { serial: target })
+        .then(res => { if (serial === target) cameras = res; })
+        .catch(() => { if (serial === target) cameras = []; })
+        .finally(() => { camerasLoading = false; });
     }
   }
 
@@ -145,7 +158,15 @@ import * as m from '../paraglide/messages';
       if (mirrorMouse !== 'default') args.push(`--mouse=${mirrorMouse}`);
     }
     if (mirrorApp && mirrorMode !== 'camera') args.push(`--start-app=${mirrorApp}`);
-    if (mirrorRecord && mirrorRecordPath) args.push(`--record=${mirrorRecordPath}`);
+    if (mirrorRecord) {
+      const recordPath = mirrorRecordPath.trim();
+      // scrcpy deduce el formato por la extensión; sin ella termina al instante sin grabar
+      if (!/\.(mkv|mp4|m4a|mka|opus|aac|flac|wav)$/i.test(recordPath)) {
+        status = m.mirror_error_recordPath();
+        return;
+      }
+      args.push(`--record=${recordPath}`);
+    }
     scrcpy(args);
   }
 
@@ -161,27 +182,38 @@ import * as m from '../paraglide/messages';
     } catch (error: any) { status = translateError(error); }
   }
 
-  async function saveAppSettings(settings: AppSettings) {
-    busy = true;
-    appSettings = settings;
+  function applySettingsSideEffects(settings: AppSettings) {
     themeState.setMaterialYouEnabled(settings.material_you_enabled ?? true);
     themeState.setMaterialYouBackgroundTint(settings.material_you_background_tint ?? true);
     applyWindowEffectClass(settings);
+  }
+
+  async function saveAppSettings(settings: AppSettings) {
+    const previous = appSettings;
+    busy = true;
+    appSettings = settings;
+    applySettingsSideEffects(settings);
     try {
       const oldPath = await invoke<string | null>('save_app_settings', { settings });
-      
+
       if (oldPath) {
-        await invoke('close_app', { oldDataDir: oldPath });
+        // The backend remembers the old data folder and removes it while exiting.
+        await invoke('close_app');
       }
       sessionStorage.setItem('cached_settings', JSON.stringify(settings));
       const w = window as any;
       if (w.__APP_SETTINGS__) {
         w.__APP_SETTINGS__ = settings;
       }
-    } catch (error: any) { 
-      status = translateError(error); 
-    } finally { 
-      busy = false; 
+      return true;
+    } catch (error: any) {
+      // Revertir el estado optimista si no se pudo guardar
+      appSettings = previous;
+      if (previous) applySettingsSideEffects(previous);
+      status = translateError(error);
+      return false;
+    } finally {
+      busy = false;
     }
   }
 
@@ -197,12 +229,30 @@ import * as m from '../paraglide/messages';
     }
   }
 
+  function syncToolPath(tool: 'adb' | 'scrcpy', path: string) {
+    if (tool === 'adb') {
+      adbPath = path;
+      syncedAdbPath = path;
+    } else {
+      scrcpyPath = path;
+      syncedScrcpyPath = path;
+    }
+  }
+
   async function saveToolPath(tool: 'adb' | 'scrcpy', pathValue: string) {
     busy = true;
     try {
       const value = await invoke<ToolsStatus>('set_tool_path', { tool, path: pathValue });
       toolsState.set(value);
-      status = m.workbench_status_toolPathSaved({ tool });
+      if (pathValue.trim() && value[tool].source !== 'custom') {
+        // El backend no encontró un ejecutable válido: se conserva lo escrito para que el usuario lo corrija
+        status = m.settings_toolPathInvalid({ tool });
+      } else {
+        syncToolPath(tool, value[tool].path);
+        status = m.workbench_status_toolPathSaved({ tool });
+      }
+      // Las rutas de herramientas viven en settings.json: mantener appSettings coherente
+      await refreshSettings();
       if (tool === 'adb') await devicesState.refreshDevices();
     } catch (error: any) { 
       status = translateError(error); 
@@ -217,7 +267,9 @@ import * as m from '../paraglide/messages';
     try {
       const value = await invoke<ToolsStatus>('install_or_update_tool', { tool });
       toolsState.set(value);
+      syncToolPath(tool, value[tool].path);
       status = m.workbench_status_toolInstalled({ tool });
+      await refreshSettings();
       if (tool === 'adb') await devicesState.refreshDevices();
     } catch (error: any) { 
       status = translateError(error); 
@@ -239,10 +291,19 @@ import * as m from '../paraglide/messages';
   }
 
   $effect(() => {
-    if (tab === 'mirroring') {
-      refreshMirrorData();
-    }
-    serial; // Re-run when serial changes
+    const currentTab = tab;
+    const currentSerial = serial;
+    untrack(() => {
+      if (currentSerial !== mirrorDataSerial) {
+        // Las listas pertenecen al dispositivo anterior: vaciarlas al cambiar de serial
+        mirrorDataSerial = currentSerial;
+        mirrorApps = [];
+        cameras = [];
+        mirrorApp = '';
+        cameraId = '';
+      }
+      if (currentTab === 'mirroring') void refreshMirrorData();
+    });
   });
 
   onMount(() => {
@@ -251,8 +312,13 @@ import * as m from '../paraglide/messages';
 
   $effect(() => {
     if (!tools) return;
-    adbPath = tools.adb.path;
-    scrcpyPath = tools.scrcpy.path;
+    const nextAdbPath = tools.adb.path;
+    const nextScrcpyPath = tools.scrcpy.path;
+    untrack(() => {
+      // Solo sincronizar si el usuario no ha editado el campo desde la última sincronización
+      if (adbPath === syncedAdbPath) syncToolPath('adb', nextAdbPath);
+      if (scrcpyPath === syncedScrcpyPath) syncToolPath('scrcpy', nextScrcpyPath);
+    });
   });
 
   $effect(() => {
@@ -278,13 +344,13 @@ import * as m from '../paraglide/messages';
     await run(['shell', 'wm', 'size', `${displayWidth}x${displayHeight}`]);
     await run(['shell', 'wm', 'density', String(displayDensity)]);
     await run(['shell', 'settings', 'put', 'system', 'screen_off_timeout', String(displayTimeout * 1000)]);
-    await devicesState.refreshDevices();
+    await devicesState.refreshDeviceDetailsSilent();
   }
 
   async function resetDisplay() {
     await run(['shell', 'wm', 'size', 'reset']);
     await run(['shell', 'wm', 'density', 'reset']);
-    await devicesState.refreshDevices();
+    await devicesState.refreshDeviceDetailsSilent();
   }
 
   async function toggleDeviceDarkMode() {
@@ -294,7 +360,7 @@ import * as m from '../paraglide/messages';
     darkModeLoading = true;
     try {
       await invoke('set_device_dark_mode', { serial, enabled: nextValue });
-      await devicesState.refreshDevices();
+      await devicesState.refreshDeviceDetailsSilent();
     } catch (error: any) {
       displayDarkMode = !nextValue;
       status = translateError(error);
@@ -307,17 +373,18 @@ import * as m from '../paraglide/messages';
     displayRefreshRate = rate;
     await run(['shell', 'settings', 'put', 'system', 'peak_refresh_rate', String(rate)]);
     await run(['shell', 'settings', 'put', 'system', 'min_refresh_rate', String(rate)]);
-    await devicesState.refreshDevices();
+    await devicesState.refreshDeviceDetailsSilent();
   }
 
   async function handleThemeChange(newTheme: 'light' | 'dark' | 'auto') {
+    const previousTheme = themeState.theme;
     themeState.setTheme(newTheme);
     if (appSettings) {
       let val = '';
       if (newTheme === 'dark') val = '1';
       else if (newTheme === 'light') val = '0';
       const updated = { ...appSettings, theme: val };
-      await saveAppSettings(updated);
+      if (!(await saveAppSettings(updated))) themeState.setTheme(previousTheme);
     }
   }
 
@@ -348,9 +415,10 @@ import * as m from '../paraglide/messages';
       onSaveAppSettings={saveAppSettings} 
       {defaultCacheDir} 
       onForceCheckUpdates={forceCheckUpdates}
+      {busy}
     />
   {:else}
-    <DeviceStateScreen {serial} loading={loading || (tab !== 'files' && busy)}>
+    <DeviceStateScreen {serial} loading={loading || (tab !== 'files' && busy)} label={busy && !loading ? m.common_processing() : undefined}>
       {#if serial}
         {#key `${serial}:${connectionRevision}`}
           {#if tab === 'display'}
@@ -362,6 +430,7 @@ import * as m from '../paraglide/messages';
             refreshRate={displayRefreshRate}
             darkMode={displayDarkMode} {darkModeLoading} suggestions={displaySuggestions}
             onToggleDarkMode={toggleDeviceDarkMode} onSetRefreshRate={setDisplayRefreshRate} onReset={resetDisplay} onApply={applyDisplay}
+            bind:status
           />
           {:else if tab === 'mirroring'}
           <MirroringPage

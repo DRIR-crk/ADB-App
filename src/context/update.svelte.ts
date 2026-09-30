@@ -51,6 +51,8 @@ class UpdateState {
           this.status = 'downloading';
         } else if (event.event === 'Progress') {
           this.downloadedBytes += event.data.chunkLength;
+        } else if (event.event === 'Finished') {
+          this.status = 'installing';
         }
       });
       const { relaunch } = await import('@tauri-apps/plugin-process');

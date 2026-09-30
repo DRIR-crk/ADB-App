@@ -1,3 +1,9 @@
+<script lang="ts" module>
+  // Module-level so the warning shows once per session, not once per mount
+  // (App remounts the layout on every language change).
+  let adbWarningShown = false;
+</script>
+
 <script lang="ts">
   import * as m from '../../paraglide/messages';
 
@@ -12,12 +18,12 @@
   import HomePage from '../../pages/HomePage.svelte';
   import WorkbenchPage from '../../pages/WorkbenchPage.svelte';
   import OperationsMenu from './OperationsMenu.svelte';
+  import WirelessHost from '../dialogs/WirelessHost.svelte';
   import { layoutState } from '../../context/layout.svelte';
 
   let activeTab = $derived(layoutState.activeTab);
   let adbAvailable = $derived(toolsState.status?.adb.available ?? true);
   let showAdbModal = $state(false);
-  let adbWarningShown = false;
   let pageElement: HTMLDivElement | undefined = $state();
 
   $effect(() => {
@@ -114,6 +120,7 @@
   </div>
   
   <OperationsMenu />
+  <WirelessHost />
   
   <AppModal 
     open={showAdbModal} 

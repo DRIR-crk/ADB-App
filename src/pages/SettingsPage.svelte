@@ -15,6 +15,7 @@ import * as m from '../paraglide/messages';
   
   import MaterialIcon from '../components/MaterialIcon.svelte';
   import AppModal from '../components/dialogs/AppModal.svelte';
+  import ConfirmDialog from '../components/dialogs/ConfirmDialog.svelte';
   import Logo from '../components/Logo.svelte';
   import { languages, getLanguageName } from '../context/i18n.svelte';
   import type { WindowEffectInfo, WindowEffectMode } from '../context/windowEffects';
@@ -35,7 +36,8 @@ import * as m from '../paraglide/messages';
     appSettings,
     onSaveAppSettings,
     defaultCacheDir,
-    onForceCheckUpdates
+    onForceCheckUpdates,
+    busy
   } = $props<{
     theme: 'light' | 'dark' | 'auto';
     language: string;
@@ -48,10 +50,11 @@ import * as m from '../paraglide/messages';
     onSaveToolPath: (tool: ConfigurableTool, path: string) => void;
     onInstallTool: (tool: InstallableTool) => void;
     onClearCache: () => void;
-    appSettings: { cache_enabled: boolean; cache_path: string; kill_adb_on_exit: boolean; auto_save_screenshots: boolean; material_you_enabled: boolean; material_you_background_tint: boolean; window_effect: WindowEffectMode; theme: string; language: string; packaged?: boolean; store_build?: boolean } | null;
-    onSaveAppSettings: (settings: { cache_enabled: boolean; cache_path: string; kill_adb_on_exit: boolean; auto_save_screenshots: boolean; material_you_enabled: boolean; material_you_background_tint: boolean; window_effect: WindowEffectMode; theme: string; language: string; packaged?: boolean; store_build?: boolean }) => void;
+    appSettings: { cache_enabled: boolean; cache_path: string; kill_adb_on_exit: boolean; pairing_detection: boolean; auto_save_screenshots: boolean; material_you_enabled: boolean; material_you_background_tint: boolean; window_effect: WindowEffectMode; theme: string; language: string; packaged?: boolean; store_build?: boolean } | null;
+    onSaveAppSettings: (settings: { cache_enabled: boolean; cache_path: string; kill_adb_on_exit: boolean; pairing_detection: boolean; auto_save_screenshots: boolean; material_you_enabled: boolean; material_you_background_tint: boolean; window_effect: WindowEffectMode; theme: string; language: string; packaged?: boolean; store_build?: boolean }) => void;
     defaultCacheDir: string;
     onForceCheckUpdates: () => void;
+    busy: boolean;
   }>();
 
   let appVersion = $state('...');
@@ -59,6 +62,8 @@ import * as m from '../paraglide/messages';
   let localCachePath = $state<string | null>(null);
   let licensesOpen = $state(false);
   let windowEffectInfo = $state<WindowEffectInfo>({ platform: 'linux', mica: false, acrylic: false });
+  let cachePathError = $state('');
+  let pendingCachePath = $state<string | null>(null);
 
   type LicenseGroup = { type: string; text: string; items: { name: string; url: string }[] };
   const LICENSE_GROUPS: LicenseGroup[] = [
@@ -146,6 +151,39 @@ import * as m from '../paraglide/messages';
       onSaveAppSettings({ ...appSettings, window_effect: windowEffect });
     }
   }
+
+  function normalizePath(value: string) {
+    return value.trim().replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase();
+  }
+
+  // La ruta guardada es la carpeta padre: el backend crea dentro una carpeta con el identificador de la app
+  function dataDirFor(parentPath: string) {
+    const defaultDir = normalizePath(defaultCacheDir);
+    const identifier = defaultDir.split('/').pop() ?? '';
+    return parentPath.trim() ? `${normalizePath(parentPath)}/${identifier}` : defaultDir;
+  }
+
+  function requestCachePathChange(nextPath: string) {
+    if (!appSettings) return;
+    cachePathError = '';
+    const current = dataDirFor(appSettings.cache_path);
+    const next = dataDirFor(nextPath);
+    if (next === current) return;
+    if (next.startsWith(`${current}/`)) {
+      // Mover la carpeta dentro de sí misma destruiría los datos
+      cachePathError = m.settings_cachePathInvalid();
+      return;
+    }
+    pendingCachePath = nextPath.trim();
+  }
+
+  function confirmCachePathChange() {
+    if (!appSettings || pendingCachePath === null) return;
+    const nextPath = pendingCachePath;
+    pendingCachePath = null;
+    if (!nextPath) localCachePath = '';
+    onSaveAppSettings({ ...appSettings, cache_path: nextPath });
+  }
 </script>
 
 <div class="settings-grid">
@@ -205,6 +243,21 @@ import * as m from '../paraglide/messages';
           onchange={(e: any) => {
             if (appSettings) {
               onSaveAppSettings({ ...appSettings, kill_adb_on_exit: e.target.selected });
+            }
+          }}
+        ></md-switch>
+      </label>
+
+      <label class="settings-switch-row" style="width: 100%; box-sizing: border-box;">
+        <div class="settings-switch-row__text">
+          <span class="md3-body-large">{m.settings_pairingDetection()}</span>
+          <small>{m.settings_pairingDetectionDesc()}</small>
+        </div>
+        <md-switch
+          selected={appSettings?.pairing_detection ?? true}
+          onchange={(e: any) => {
+            if (appSettings) {
+              onSaveAppSettings({ ...appSettings, pairing_detection: e.target.selected });
             }
           }}
         ></md-switch>
@@ -342,28 +395,28 @@ import * as m from '../paraglide/messages';
           </md-icon-button>
         </md-outlined-text-field>
         <div class="button-row">
-          <md-filled-button onclick={() => onSaveToolPath(toolName, path)}>
+          <md-filled-button disabled={busy ? true : undefined} onclick={() => onSaveToolPath(toolName, path)}>
             {m.settings_savePath()}
           </md-filled-button>
           {#if appSettings?.store_build && toolName === 'adb'}
-            <md-outlined-button onclick={() => onSaveToolPath(toolName, '')}>
+            <md-outlined-button disabled={busy ? true : undefined} onclick={() => onSaveToolPath(toolName, '')}>
               <MaterialIcon name="restore" slot="icon" />
               {m.common_reset()}
             </md-outlined-button>
           {:else}
-            <md-outlined-button onclick={() => onSaveToolPath(toolName, '')}>
+            <md-outlined-button disabled={busy ? true : undefined} onclick={() => onSaveToolPath(toolName, '')}>
               {m.settings_autoDetect()}
             </md-outlined-button>
           {/if}
           
           {#if tool?.install_supported && !tool.available && !appSettings?.store_build}
-            <md-filled-button onclick={() => onInstallTool(toolName)}>
+            <md-filled-button disabled={busy ? true : undefined} onclick={() => onInstallTool(toolName)}>
               <MaterialIcon name="download" slot="icon" />
               {m.settings_install()} {title.split(' ')[0]}
             </md-filled-button>
           {/if}
-          {#if tool?.install_supported && tool.update_available && !appSettings?.store_build}
-            <md-filled-button onclick={() => onInstallTool(toolName)}>
+          {#if tool?.install_supported && tool.update_available && tool.source === 'managed' && !appSettings?.store_build}
+            <md-filled-button disabled={busy ? true : undefined} onclick={() => onInstallTool(toolName)}>
               <MaterialIcon name="update" slot="icon" />
               {m.settings_update()} {title.split(' ')[0]}
             </md-filled-button>
@@ -411,7 +464,7 @@ import * as m from '../paraglide/messages';
       {:else}
         <md-outlined-text-field
           use:materialTextFieldValue={localCachePath || appSettings?.cache_path || defaultCacheDir}
-          oninput={(e: any) => localCachePath = e.target.value}
+          oninput={(e: any) => { localCachePath = e.target.value; cachePathError = ''; }}
           label={m.settings_cachePathPlaceholder()}
           style="width: 100%"
         >
@@ -421,24 +474,23 @@ import * as m from '../paraglide/messages';
         </md-outlined-text-field>
 
         <div class="button-row settings-cache-actions" style="margin-top: 16px">
-          <md-filled-button onclick={() => {
-            if (appSettings && localCachePath !== null) {
-              onSaveAppSettings({ ...appSettings, cache_path: localCachePath });
-            }
+          <md-filled-button disabled={busy ? true : undefined} onclick={() => {
+            if (localCachePath !== null) requestCachePathChange(localCachePath);
           }}>
             {m.settings_savePath()}
           </md-filled-button>
 
-          <md-outlined-button onclick={() => {
-            if (appSettings) {
-              localCachePath = '';
-              onSaveAppSettings({ ...appSettings, cache_path: '' });
-            }
-          }}>
+          <md-outlined-button disabled={busy ? true : undefined} onclick={() => requestCachePathChange('')}>
             {m.common_reset()}
           </md-outlined-button>
           {@render clearCacheButton()}
         </div>
+        {#if cachePathError}
+          <p style="font-size: 13px; color: var(--md-sys-color-error); display: flex; align-items: center; gap: 6px; margin: 8px 0 0">
+            <MaterialIcon name="error" size={16} />
+            {cachePathError}
+          </p>
+        {/if}
         <p style="font-size: 13px; color: var(--md-sys-color-error); display: flex; align-items: center; gap: 6px; margin: 8px 0 0">
           <MaterialIcon name="info" size={16} />
           {m.settings_cacheRestartWarning()}
@@ -500,7 +552,7 @@ import * as m from '../paraglide/messages';
           </span>
           <div style="display: flex; align-items: center; gap: 6px">
             <strong style="font-size: 15px; color: var(--md-sys-color-on-surface)">Kyro206</strong>
-            <md-icon-button onclick={() => openUrl('https://github.com/kyro206')} title="GitHub Profile" style="--md-icon-button-icon-size: 16px;">
+            <md-icon-button onclick={() => openUrl('https://github.com/kyro206')} title={m.settings_githubProfile()} style="--md-icon-button-icon-size: 16px;">
               <MaterialIcon name="open_in_new" size={16} />
             </md-icon-button>
           </div>
@@ -509,6 +561,15 @@ import * as m from '../paraglide/messages';
       
     </div>
   </section>
+  <ConfirmDialog
+    open={pendingCachePath !== null}
+    title={m.settings_cacheMoveConfirmTitle()}
+    message={m.settings_cacheMoveConfirm()}
+    confirmText={m.common_continue()}
+    isDanger={true}
+    onConfirm={confirmCachePathChange}
+    onCancel={() => pendingCachePath = null}
+  />
   <AppModal open={licensesOpen} onClose={() => licensesOpen = false} title={m.settings_aboutLicenses()} width="large">
     <div style="display: flex; flex-direction: column; gap: 24px">
       <div style="background: var(--md-sys-color-surface-container); padding: 16px; border-radius: 12px; overflow-y: auto; border: 1px solid var(--md-sys-color-outline-variant)">
@@ -699,6 +760,19 @@ md-outlined-select {
 .settings-switch-row span {
   font-weight: 500;
   color: var(--md-sys-color-on-surface);
+}
+
+.settings-switch-row__text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.settings-switch-row__text small {
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 13px;
+  line-height: 1.35;
 }
 
 @media (max-width: 1000px) {

@@ -4,6 +4,7 @@
   import { operationsState, type OperationStatus } from '../../context/operations.svelte';
   import { openPath } from '@tauri-apps/plugin-opener';
   import ContextMenu from './ContextMenu.svelte';
+  import { translateError } from '../../pages/workbench/utils';
   
   function getIconForJob(job: any) {
     if (job.type === 'install') return 'android';
@@ -13,6 +14,11 @@
   }
 
   let contextMenu = $state<{ x: number; y: number; job: any } | null>(null);
+  let openError = $state('');
+
+  $effect(() => {
+    if (!operationsState.isOpen) openError = '';
+  });
 
   function handleContextMenu(e: MouseEvent, job: any) {
     e.preventDefault();
@@ -57,6 +63,9 @@
       </div>
     </header>
     
+    {#if openError}
+      <p class="transfer-menu__error" role="alert">{openError}</p>
+    {/if}
     <div class="transfer-menu__content">
       {#if operationsState.jobs.length === 0}
         <div class="transfer-menu__empty">
@@ -146,9 +155,9 @@
         onClick: () => {
           const job = contextMenu!.job;
           const path = job.type === 'download' ? job.destination : job.source;
+          openError = '';
           if (path) openPath(path).catch((err) => {
-            job.status = 'error';
-            job.error = String(err);
+            openError = translateError(err);
           });
         },
         disabled: contextMenu.job.type === 'download' && contextMenu.job.status !== 'success'
@@ -216,6 +225,15 @@
 .transfer-menu__actions {
   display: flex;
   gap: 4px;
+}
+
+.transfer-menu__error {
+  margin: 0;
+  padding: 8px 16px;
+  font-size: 12px;
+  color: var(--md-sys-color-error);
+  background: var(--md-sys-color-error-container);
+  word-break: break-word;
 }
 
 .transfer-menu__content {

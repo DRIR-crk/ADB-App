@@ -15,6 +15,7 @@ class ThemeState {
   loaded = $state(false);
   dynamicPaletteError = $state<string | null>(null);
   wallpaperClockColor = $state('');
+  #applyId = 0;
 
   constructor() {
     this.init();
@@ -37,10 +38,13 @@ class ThemeState {
       if (settings.theme === '1') t = 'dark';
       else if (settings.theme === '0') t = 'light';
       this.theme = t;
+      // Set data-theme before the first paint so the theme variables exist from the first frame
+      this.#setResolved(this.#resolve(t));
       this.materialYouEnabled = settings.material_you_enabled ?? true;
       this.materialYouBackgroundTint = settings.material_you_background_tint ?? true;
     } catch {
       // default auto
+      this.#setResolved(this.#resolve('auto'));
     } finally {
       this.loaded = true;
     }
@@ -48,6 +52,7 @@ class ThemeState {
 
   async applyTheme(currentTheme: Theme) {
     if (!this.loaded) return;
+    const applyId = ++this.#applyId;
     
     try {
       await invoke('set_window_theme', { theme: currentTheme });
@@ -57,13 +62,19 @@ class ThemeState {
       }
     } catch (e) {}
 
-    let resolvedTheme: ResolvedTheme = currentTheme === 'light' || currentTheme === 'dark' ? currentTheme : 'dark';
-    if (currentTheme === 'auto') {
-      const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-      resolvedTheme = isDark ? 'dark' : 'light';
-    }
-    this.resolvedTheme = resolvedTheme;
-    document.documentElement.setAttribute('data-theme', resolvedTheme);
+    // A newer call (theme toggled again / OS theme changed meanwhile) supersedes this one
+    if (applyId !== this.#applyId) return;
+    this.#setResolved(this.#resolve(currentTheme));
+  }
+
+  #resolve(theme: Theme): ResolvedTheme {
+    if (theme === 'light' || theme === 'dark') return theme;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+
+  #setResolved(resolved: ResolvedTheme) {
+    this.resolvedTheme = resolved;
+    document.documentElement.setAttribute('data-theme', resolved);
   }
 
   setTheme(newTheme: Theme) {
@@ -334,6 +345,16 @@ export function initThemeEffects() {
     const requestId = ++paletteRequestId;
 
     if (!source) {
+      // Keep the current palette while the selected device is still (re)loading its wallpaper,
+      // instead of flashing the default palette on every device switch; reset once it is known
+      // there is no wallpaper (load finished without one) or no device is selected.
+      const waitingForWallpaper = devicesState.selectedDevice?.state === 'device'
+        && (devicesState.wallpaperLoading || devicesState.operationalLoading);
+      if (waitingForWallpaper && lastPaletteSeed && materialYouEnabled) {
+        applyDynamicPalette(lastPaletteSeed, theme, backgroundTint);
+        themeState.hasActiveDynamicPalette = true;
+        return;
+      }
       lastPaletteSource = null;
       lastPaletteSeed = null;
       themeState.wallpaperClockColor = '';

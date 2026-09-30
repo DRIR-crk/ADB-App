@@ -52,6 +52,8 @@ export default defineConfig(async ({ mode }) => ({
           if (id.includes('node_modules')) {
             if (id.includes('@material/web')) return 'material';
             if (id.includes('@tauri-apps')) return 'tauri';
+            // Loaded on demand (QR tab of the wireless dialog): keep out of the startup chunk.
+            if (/node_modules[\/](qrcode|dijkstrajs|can-promise|encode-utf8|pngjs)[\/]/.test(id)) return undefined;
             return 'vendor-other';
           }
         }

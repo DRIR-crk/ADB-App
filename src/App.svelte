@@ -22,6 +22,7 @@ import * as m from './paraglide/messages';
     if (updateState.status === 'downloading') {
       return updateState.totalBytes ? `${m.updater_status_downloading()} (${updateState.progress}%)` : m.updater_status_downloading();
     }
+    if (updateState.status === 'installing') return m.updater_status_installing();
     return '';
   }
 
@@ -71,6 +72,7 @@ import * as m from './paraglide/messages';
       title={m.updater_availableTitle()}
       onClose={() => updateState.showUpdateDialog = false}
       width="compact"
+      cancelDisabled={updateState.busy}
     >
       <div style="display: flex; flex-direction: column; gap: 16px;">
         <p style="margin: 0; color: var(--on-surface-variant); line-height: 1.5; white-space: pre-wrap;">

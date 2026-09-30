@@ -5,13 +5,14 @@ import * as m from '../../paraglide/messages';
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { getName } from '@tauri-apps/api/app';
-  import { devicesState } from '../../context/devices.svelte';
+  import { devicesState, isWirelessSerial } from '../../context/devices.svelte';
   
-  import WirelessDialog from '../dialogs/WirelessDialog.svelte';
+  import { wirelessState } from '../../context/wireless.svelte';
   import MaterialIcon from '../MaterialIcon.svelte';
   import DeviceSelector from './DeviceSelector.svelte';
   import Logo from '../Logo.svelte';
   import { operationsState } from '../../context/operations.svelte';
+  import { translateError } from '../../pages/workbench/utils';
   
   let { adbAvailable = true } = $props<{ adbAvailable?: boolean }>();
 
@@ -24,7 +25,6 @@ import * as m from '../../paraglide/messages';
     return 'windows';
   }
 
-  let wirelessOpen = $state(false);
   let tcpipBusy = $state(false);
   let maximized = $state(false);
   let appName = $state('ADB App');
@@ -37,13 +37,19 @@ import * as m from '../../paraglide/messages';
     appWindow.isMaximized().then(m => maximized = m);
     
     let unlistenFn: (() => void) | null = null;
+    let resizeTimer = 0;
     appWindow.onResized(() => {
-      appWindow.isMaximized().then(m => maximized = m);
+      // Resize events fire per frame while dragging; check the maximized state once it settles
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        appWindow.isMaximized().then(m => maximized = m);
+      }, 100);
     }).then(unlisten => {
       unlistenFn = unlisten;
     });
     
     return () => { 
+      window.clearTimeout(resizeTimer);
       if (unlistenFn) unlistenFn(); 
     };
   });
@@ -54,13 +60,19 @@ import * as m from '../../paraglide/messages';
     try {
       await invoke<string>('connect_usb_over_tcpip', { serial: devicesState.selectedDevice.serial });
       await devicesState.refreshDevices();
+    } catch (error) {
+      devicesState.error = translateError(error);
     } finally {
       tcpipBusy = false;
     }
   }
 
   async function handleDisconnect(serial: string) {
-    await invoke('disconnect_wireless_device', { endpoint: serial });
+    try {
+      await invoke('disconnect_wireless_device', { endpoint: serial });
+    } catch (error) {
+      devicesState.error = translateError(error);
+    }
     await devicesState.refreshDevices();
   }
 </script>
@@ -78,7 +90,7 @@ import * as m from '../../paraglide/messages';
   <div class="topbar__device-section" ondblclick={e => e.stopPropagation()}>
     <button 
       class="topbar__tcpip" 
-      disabled={!devicesState.selectedDevice || devicesState.selectedDevice.state !== 'device' || (devicesState.selectedDevice.serial.includes(':') || devicesState.selectedDevice.serial.includes('._tcp')) || tcpipBusy} 
+      disabled={!devicesState.selectedDevice || devicesState.selectedDevice.state !== 'device' || isWirelessSerial(devicesState.selectedDevice.serial) || tcpipBusy} 
       onclick={connectUsbOverTcpip} 
       title={m.topbar_tcpip_tooltip()}
     >
@@ -108,8 +120,8 @@ import * as m from '../../paraglide/messages';
     {/if}
 
     <button 
-      class="topbar__wireless {wirelessOpen ? 'active' : ''}" 
-      onclick={() => wirelessOpen = true} 
+      class="topbar__wireless {wirelessState.dialogOpen ? 'active' : ''}" 
+      onclick={() => wirelessState.open()} 
       title={m.topbar_wireless_tooltip()} 
       disabled={!adbAvailable}
     >
@@ -134,11 +146,6 @@ import * as m from '../../paraglide/messages';
   {/if}
 </header>
 
-<WirelessDialog open={wirelessOpen} onClose={() => {
-  wirelessOpen = false;
-  devicesState.refreshDevices();
-}} />
-
 <style>
 :global {
 .topbar {
@@ -157,7 +164,7 @@ import * as m from '../../paraglide/messages';
 .topbar__tcpip,.topbar__wireless,.topbar__action-btn{display:flex;align-items:center;justify-content:center;height:30px;color:var(--on-surface-variant);background:var(--surface-container-high);border:0;border-radius:var(--radius-full)}
 .topbar__tcpip{gap:2px;width:82px;padding:0 8px;white-space:nowrap}.topbar__tcpip :global(.material-symbols-rounded){font-size:17px}.topbar__tcpip :global(.material-symbols-rounded):nth-of-type(2){font-size:13px}.topbar__tcpip:hover:not(:disabled),.topbar__wireless:hover,.topbar__wireless.active,.topbar__action-btn:hover:not(:disabled),.topbar__operations.active{color:var(--on-primary-container);background:var(--primary-container)}
 .topbar__wireless,.topbar__action-btn{flex:0 0 30px;width:30px}
-.topbar__operations.error { color: var(--md-sys-color-error); background: var(--md-sys-color-error); }
+.topbar__operations.error { color: var(--md-sys-color-on-error); background: var(--md-sys-color-error); }
 .topbar__operations.error:hover { background: color-mix(in srgb, var(--md-sys-color-error) 80%, black); }
 .topbar__operations.processing { animation: pulse-blue 2s infinite; }
 

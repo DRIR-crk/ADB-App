@@ -1,8 +1,9 @@
 
 
 <script lang="ts">
-  import { onDestroy, tick } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { join } from '@tauri-apps/api/path';
   import { open } from '@tauri-apps/plugin-dialog';
   import { getCurrentWebview } from '@tauri-apps/api/webview';
   import { stat } from '@tauri-apps/plugin-fs';
@@ -36,6 +37,7 @@
   let fileView = $state<FileView>('list');
   let fileFilter = $state('');
   let filePathEditing = $state(false);
+  let pathDraft = $state('');
   let fileSort = $state<{ key: FileSortKey; direction: 'asc' | 'desc' }>({ key: 'name', direction: 'asc' });
   let selectedFiles = $state<string[]>([]);
   let lastSelectedIndex = $state<number | null>(null);
@@ -51,6 +53,17 @@
   
   let osDragHover = $state(false);
   let pendingThumbnails = new Set<string>();
+  const thumbnailQueue: Array<{ path: string; generation: number }> = [];
+  let thumbnailOrder: string[] = [];
+  let thumbnailBytes = 0;
+  let thumbnailActive = 0;
+  let thumbnailGeneration = 0;
+  let listGrid = $state<{ scrollToIndex: (index: number) => void } | null>(null);
+  let cardGrid = $state<{ scrollToIndex: (index: number) => void } | null>(null);
+  let alive = true;
+  let listingSeq = 0;
+  let audioSeq = 0;
+  const MAX_OPEN_BYTES = 25 * 1024 * 1024;
   
   let audioPlayer: HTMLAudioElement | undefined = $state();
   let audioPlayingPath = $state<string | null>(null);
@@ -65,15 +78,21 @@
     
     if (audioPlayingPath === remotePath) {
       if (audioIsPlaying) audioPlayer?.pause();
-      else audioPlayer?.play();
+      else audioPlayer?.play().catch(error => { status = translateError(error); });
       return;
     }
+    if (file.size >= MAX_OPEN_BYTES) {
+      status = m.files_status_tooLarge({ limit: formatBytes(MAX_OPEN_BYTES) });
+      return;
+    }
+    const token = ++audioSeq;
     
     audioLoading = true;
     audioProgress = 0;
     audioPlayingPath = remotePath;
     try {
       const response = await invoke<ArrayBuffer | Uint8Array | number[]>('read_file_bytes', { serial: serial, path: remotePath });
+      if (!alive || token !== audioSeq) return;
       const data = response instanceof ArrayBuffer ? response : new Uint8Array(response as any);
       const blob = new Blob([data], { type: 'audio/mpeg' });
       if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -88,14 +107,16 @@
       }
       
       await tick();
+      if (!alive || token !== audioSeq) return;
       audioPlayer?.play().catch(error => {
-        status = translateError(error);
+        if (alive && token === audioSeq) status = translateError(error);
       });
     } catch (e) {
+      if (!alive || token !== audioSeq) return;
       status = translateError(e);
       audioPlayingPath = null;
     } finally {
-      audioLoading = false;
+      if (alive && token === audioSeq) audioLoading = false;
     }
   }
 
@@ -107,6 +128,14 @@
   }
 
   onDestroy(() => {
+    alive = false;
+    // `busy` belongs to the parent and drives its page-wide overlay: a listing/open that was
+    // still running when the tab changed can no longer reset it (its writes are guarded).
+    busy = false;
+    listingSeq++;
+    audioSeq++;
+    thumbnailGeneration++;
+    thumbnailQueue.length = 0;
     if (audioUrl) {
       URL.revokeObjectURL(audioUrl);
     }
@@ -189,7 +218,7 @@
 
   function normalizeDevicePath(value: string) {
     const parts: string[] = [];
-    for (const part of value.replace(/\\/g, '/').split('/')) {
+    for (const part of value.split('/')) {
       if (!part || part === '.') continue;
       if (part === '..') parts.pop(); else parts.push(part);
     }
@@ -199,12 +228,12 @@
   const filePath = (file: FileEntry) => normalizeDevicePath(`${path}/${file.name}`);
   const linkPath = (file: FileEntry) => normalizeDevicePath(file.link_target.startsWith('/') ? file.link_target : `${path}/${file.link_target}`);
 
-  let filteredFiles = $derived.by(() => {
-    const query = fileFilter.trim().toLowerCase();
-    const matching = files.filter(file => !query || (file.name || '').toLowerCase().includes(query) || (file.link_target || '').toLowerCase().includes(query));
+  const fileCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+  let sortedFiles = $derived.by(() => {
     const direction = fileSort.direction === 'asc' ? 1 : -1;
     
-    return [...matching].sort((left, right) => {
+    return [...files].sort((left, right) => {
       if (left.is_directory !== right.is_directory) {
         return left.is_directory ? -1 : 1;
       }
@@ -212,8 +241,14 @@
       const rightValue = fileSort.key === 'type' ? (right.is_link ? 'link' : right.is_directory ? 'directory' : 'file') : right[fileSort.key];
       return (typeof leftValue === 'number' && typeof rightValue === 'number'
         ? leftValue - rightValue
-        : String(leftValue).localeCompare(String(rightValue), 'es', { numeric: true, sensitivity: 'base' })) * direction;
+        : fileCollator.compare(String(leftValue), String(rightValue))) * direction;
     });
+  });
+
+  let filteredFiles = $derived.by(() => {
+    const query = fileFilter.trim().toLowerCase();
+    if (!query) return sortedFiles;
+    return sortedFiles.filter(file => (file.name || '').toLowerCase().includes(query) || (file.link_target || '').toLowerCase().includes(query));
   });
 
   let selectedFileSet = $derived(new Set(selectedFiles));
@@ -225,34 +260,41 @@
 
   async function refreshFiles(nextPath = path, addHistory = false) {
     if (!serial) return;
+    const seq = ++listingSeq;
     busy = true;
     try {
       const normalized = normalizeDevicePath(nextPath);
       const value = await invoke<FileEntry[]>('list_directory', { serial: serial, path: normalized });
+      if (!alive || seq !== listingSeq) return;
+      const pathChanged = normalized !== path;
       files = value;
       path = normalized;
       selectedFiles = [];
       lastSelectedIndex = null;
+      keyboardFocusIndex = null;
       status = '';
-      fileThumbnails = {};
-      pendingThumbnails.clear();
+      if (pathChanged) resetThumbnails();
       if (addHistory && normalized !== fileHistory[fileHistoryIndex]) {
         fileHistory = [...fileHistory.slice(0, fileHistoryIndex + 1), normalized];
         fileHistoryIndex++;
       }
-    } catch (error) { 
+    } catch (error) {
+      if (!alive || seq !== listingSeq) return;
       status = translateError(error);
-    } finally { 
-      busy = false; 
+    } finally {
+      if (alive && seq === listingSeq) busy = false;
     }
   }
 
   async function softRefreshFiles() {
     if (!serial) return;
+    const seq = listingSeq;
+    const target = path;
     try {
-      const value = await invoke<FileEntry[]>('list_directory', { serial: serial, path });
+      const value = await invoke<FileEntry[]>('list_directory', { serial: serial, path: target });
+      if (!alive || seq !== listingSeq || target !== path) return;
       files = value;
-    } catch (error) { 
+    } catch (error) {
       // Ignorar
     }
   }
@@ -260,20 +302,18 @@
   async function openFileEntry(file: FileEntry) {
     if (file.is_directory) return refreshFiles(filePath(file), true);
     if (file.is_link) return refreshFiles(linkPath(file), true);
+    if (file.size >= MAX_OPEN_BYTES) {
+      status = m.files_status_tooLarge({ limit: formatBytes(MAX_OPEN_BYTES) });
+      return;
+    }
     
-    if (file.size < 25 * 1024 * 1024) {
-      busy = true;
-      try {
-        await invoke('download_and_open_file', { 
-          serial, 
-          remotePath: filePath(file), 
-          fileName: file.name 
-        });
-      } catch (error) {
-        // ignorado
-      } finally {
-        busy = false;
-      }
+    busy = true;
+    try {
+      await invoke('download_and_open_file', { serial, remotePath: filePath(file), fileName: file.name });
+    } catch (error) {
+      if (alive) status = translateError(error);
+    } finally {
+      if (alive) busy = false;
     }
   }
 
@@ -291,22 +331,17 @@
 
   async function uploadLocalPaths(paths: string[]) {
     if (!paths.length) return;
+    const destination = path;
     for (const localPath of paths) {
       let isDirectory = false;
-      let statError: string | undefined = undefined;
       try {
         const metadata = await stat(localPath);
         isDirectory = metadata.isDirectory;
-      } catch (e) {
-        statError = translateError(e);
+      } catch {
+        // Si no se puede inspeccionar la ruta local, adb push informará del error real en la cola
       }
       const name = localPath.split(/[\\/]/).pop() || localPath;
-      
-      if (statError) {
-        operationsState.jobs = [...operationsState.jobs, { id: Date.now().toString() + Math.random().toString(), type: 'upload', name, source: localPath, destination: path, isDirectory: false, status: 'error', error: statError }];
-      } else {
-        enqueueTransfer('upload', localPath, path, name, isDirectory);
-      }
+      enqueueTransfer('upload', localPath, destination, name, isDirectory);
     }
     operationsState.isOpen = true;
   }
@@ -323,7 +358,7 @@
     if (!destination || Array.isArray(destination)) return;
     
     for (const file of selectedFileEntries) {
-      const localPath = `${destination}\\${file.name}`;
+      const localPath = await join(destination, file.name);
       enqueueTransfer('download', filePath(file), localPath, file.name, file.is_directory);
     }
     operationsState.isOpen = true;
@@ -333,16 +368,23 @@
     return `'${p.replace(/'/g, "'\\''")}'`;
   }
 
+  // Agrupa rutas ya escapadas en pocos argumentos para no lanzar un proceso adb por cada ruta
+  function chunkShellArgs(args: string[], size = 50) {
+    const chunks: string[] = [];
+    for (let i = 0; i < args.length; i += size) chunks.push(args.slice(i, i + size).join(' '));
+    return chunks;
+  }
+
   async function runFileAction(args: string[]) {
     if (!serial) throw new Error(m.workbench_status_selectDevice());
     busy = true;
     try {
       const output = await invoke<string>('run_device_action', { serial, args });
-      status = output;
+      if (alive) status = output;
     } catch (error) {
       throw new Error(translateError(error));
     } finally {
-      busy = false;
+      if (alive) busy = false;
     }
   }
 
@@ -351,11 +393,11 @@
     busy = true;
     try {
       const output = await invoke<string>('run_device_action_batch', { serial, prefixArgs, paths });
-      status = output;
+      if (alive) status = output;
     } catch (error) {
       throw new Error(translateError(error));
     } finally {
-      busy = false;
+      if (alive) busy = false;
     }
   }
 
@@ -398,9 +440,12 @@
       m.common_delete(),
       async () => {
         const paths = selectedFileEntries.map(f => escapeAdbPath(filePath(f)));
-        await runFileActionBatch(['shell', 'rm', '-rf'], paths);
-        selectedFiles = [];
-        await refreshFiles();
+        try {
+          await runFileActionBatch(['shell', 'rm', '-rf'], chunkShellArgs(paths));
+          selectedFiles = [];
+        } finally {
+          await refreshFiles();
+        }
       },
       true
     );
@@ -432,8 +477,11 @@
 
     await asyncPermissions(m.files_action_permissions(), initialMode, async mode => {
       const paths = selectedFileEntries.map(f => escapeAdbPath(filePath(f)));
-      await runFileActionBatch(['shell', 'chmod', mode], paths);
-      await refreshFiles();
+      try {
+        await runFileActionBatch(['shell', 'chmod', mode], chunkShellArgs(paths));
+      } finally {
+        await refreshFiles();
+      }
     });
   }
 
@@ -457,15 +505,15 @@
     }
   });
 
-  $effect(() => {
-    // only runs on serial change because serial is a prop
+  // Los cambios de dispositivo remontan el componente ({#key serial} en WorkbenchPage),
+  // así que la carga inicial va en onMount y no en un $effect que dependería también de `path`.
+  onMount(() => {
     refreshFiles();
   });
 
   $effect(() => {
     if (tab !== 'files') {
-      fileThumbnails = {};
-      pendingThumbnails.clear();
+      resetThumbnails();
     }
   });
 
@@ -500,27 +548,76 @@
 
   import type { Action } from 'svelte/action';
 
-  const lazyLoadThumbnail: Action<HTMLElement, string> = (node, remotePath) => {
-    if (!/\.(png|jpe?g|webp|gif)$/i.test(remotePath)) return;
-    
+  const THUMBNAIL_PATTERN = /\.(png|jpe?g|webp|gif)$/i;
+  const THUMBNAIL_MAX_BYTES = 1.5 * 1024 * 1024;
+  const THUMBNAIL_MAX_CONCURRENT = 4;
+  const THUMBNAIL_CACHE_BYTES = 64 * 1024 * 1024;
+
+  function resetThumbnails() {
+    thumbnailGeneration++;
+    thumbnailQueue.length = 0;
+    pendingThumbnails.clear();
+    thumbnailOrder = [];
+    thumbnailBytes = 0;
+    fileThumbnails = {};
+  }
+
+  function storeThumbnail(remotePath: string, value: string) {
+    fileThumbnails[remotePath] = value;
+    if (!value) return;
+    thumbnailOrder.push(remotePath);
+    thumbnailBytes += value.length;
+    while (thumbnailBytes > THUMBNAIL_CACHE_BYTES && thumbnailOrder.length > 1) {
+      const evicted = thumbnailOrder.shift()!;
+      thumbnailBytes -= fileThumbnails[evicted]?.length ?? 0;
+      delete fileThumbnails[evicted];
+    }
+  }
+
+  function pumpThumbnails() {
+    while (thumbnailActive < THUMBNAIL_MAX_CONCURRENT && thumbnailQueue.length) {
+      const request = thumbnailQueue.shift()!;
+      if (request.generation !== thumbnailGeneration) continue;
+      thumbnailActive++;
+      invoke<string>('get_file_thumbnail', { serial, path: request.path })
+        .then(value => { if (request.generation === thumbnailGeneration) storeThumbnail(request.path, value); })
+        .catch(() => { if (request.generation === thumbnailGeneration) storeThumbnail(request.path, ''); })
+        .finally(() => {
+          thumbnailActive--;
+          if (request.generation === thumbnailGeneration) pendingThumbnails.delete(request.path);
+          pumpThumbnails();
+        });
+    }
+  }
+
+  function requestThumbnail(remotePath: string) {
+    if (pendingThumbnails.has(remotePath) || fileThumbnails[remotePath] !== undefined) return;
+    pendingThumbnails.add(remotePath);
+    thumbnailQueue.push({ path: remotePath, generation: thumbnailGeneration });
+    pumpThumbnails();
+  }
+
+  const lazyLoadThumbnail: Action<HTMLElement, { path: string; size: number }> = (node, params) => {
+    let current = params;
     const observer = new IntersectionObserver(entries => {
-      entries.forEach(entry => {
-        if (entry.isIntersecting) {
-          if (!pendingThumbnails.has(remotePath) && fileThumbnails[remotePath] === undefined) {
-            pendingThumbnails.add(remotePath);
-            invoke<string>('get_file_thumbnail', { serial, path: remotePath })
-              .then(value => { fileThumbnails[remotePath] = value; })
-              .catch(() => { fileThumbnails[remotePath] = ''; })
-              .finally(() => { pendingThumbnails.delete(remotePath); });
-          }
-          observer.unobserve(node);
+      for (const entry of entries) {
+        if (entry.isIntersecting && current.size <= THUMBNAIL_MAX_BYTES && THUMBNAIL_PATTERN.test(current.path)) {
+          requestThumbnail(current.path);
         }
-      });
+      }
     }, { rootMargin: '100px' });
-    
     observer.observe(node);
-    
+
     return {
+      update(next) {
+        const changed = next.path !== current.path;
+        current = next;
+        if (changed) {
+          // El nodo se reutiliza para otro archivo: volver a evaluar la intersección con la nueva ruta
+          observer.unobserve(node);
+          observer.observe(node);
+        }
+      },
       destroy() { observer.disconnect(); }
     };
   };
@@ -570,11 +667,12 @@
   }
   
   const sortIcon = (key: FileSortKey) => fileSort.key === key ? (fileSort.direction === 'asc' ? 'arrow_upward' : 'arrow_downward') : 'unfold_more';
-  let currentFolderName = $derived(path === '/' ? 'root' : path.split('/').pop());
+  let currentFolderName = $derived(path === '/' ? m.files_root_folder() : path.split('/').pop());
 
   function handleKeyDown(e: KeyboardEvent) {
     const target = e.target as HTMLElement;
-    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return;
+    // Los campos md-* retargetean el evento a su host, así que también hay que comprobar el ancestro
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable || target.closest('md-outlined-text-field, md-filled-text-field')) return;
 
     if (e.key.toLowerCase() === 'a' && (e.ctrlKey || e.metaKey)) {
       if (!promptConfig && !permissionsConfig && !confirmConfig) {
@@ -618,16 +716,12 @@
           selectedFiles = [file.name];
         }
         
-        setTimeout(() => {
-          const container = document.querySelector('.file-browser');
-          if (!container) return;
-          const selector = fileView === 'list' ? '.file-list-row' : '.file-grid-card';
-          const elements = container.querySelectorAll(selector);
-          if (elements[currentIndex]) {
-            (elements[currentIndex] as HTMLElement).focus();
-            (elements[currentIndex] as HTMLElement).scrollIntoView({ block: 'nearest' });
-          }
-        }, 10);
+        // La lista está virtualizada: se desplaza el contenedor y después se enfoca el nodo ya renderizado
+        (fileView === 'list' ? listGrid : cardGrid)?.scrollToIndex(currentIndex);
+        void tick().then(() => {
+          const element = document.querySelector<HTMLElement>(`.file-browser [data-index="${currentIndex}"]`);
+          element?.focus({ preventScroll: true });
+        });
       }
     }
   }
@@ -652,18 +746,18 @@
     </div>
     
     <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <div class="file-address {filePathEditing ? 'editing' : ''}" onclick={() => filePathEditing = true}>
+    <div class="file-address {filePathEditing ? 'editing' : ''}" onclick={() => { if (!filePathEditing) { pathDraft = path; filePathEditing = true; } }}>
       {#if filePathEditing}
         <!-- svelte-ignore a11y_autofocus -->
         <md-outlined-text-field 
           autofocus 
-          use:materialTextFieldValue={path}
+          use:materialTextFieldValue={pathDraft}
           aria-label={m.files_nav_path()} 
           onfocus={(event: any) => event.currentTarget.select()} 
           onblur={() => filePathEditing = false} 
-          oninput={(event: any) => path = event.currentTarget.value} 
+          oninput={(event: any) => pathDraft = event.currentTarget.value} 
           onkeydown={(event: any) => { 
-            if (event.key === 'Enter') { refreshFiles(path, true); filePathEditing = false; } 
+            if (event.key === 'Enter') { refreshFiles(pathDraft, true); filePathEditing = false; } 
             if (event.key === 'Escape') filePathEditing = false; 
           }} 
         ></md-outlined-text-field>
@@ -732,7 +826,7 @@
       <md-icon-button aria-label={m.files_action_permissions()} title={m.files_action_permissions()} disabled={selectedFileEntries.length === 0 ? true : undefined} onclick={changeSelectedPermissions}>
         <MaterialIcon name="admin_panel_settings" />
       </md-icon-button>
-      <md-icon-button class="danger" aria-label={m.common_delete()} title={`${m.common_delete()} (Supr)`} disabled={selectedFileEntries.length === 0 ? true : undefined} onclick={deleteSelectedFiles}>
+      <md-icon-button class="danger" aria-label={m.common_delete()} title={`${m.common_delete()} (${m.files_shortcut_delete()})`} disabled={selectedFileEntries.length === 0 ? true : undefined} onclick={deleteSelectedFiles}>
         <MaterialIcon name="delete" />
       </md-icon-button>
     </div>
@@ -754,10 +848,12 @@
         </div>
         <div style="flex: 1; min-height: 0; position: relative;">
           <VirtualGrid
+            bind:this={listGrid}
             items={filteredFiles}
             itemHeight={54}
             minItemWidth="100%"
             key={(file) => file.name}
+            resetKey={path}
           >
             {#snippet row(file, index)}
               {@render fileRow(file, index)}
@@ -770,11 +866,13 @@
     {#if fileView === 'grid'}
       <div class="file-grid-view-container" style="flex: 1; min-height: 0; position: relative; padding: 14px; box-sizing: border-box;">
         <VirtualGrid
+          bind:this={cardGrid}
           items={filteredFiles}
           itemHeight={210}
           minItemWidth={170}
           gap={12}
           key={(file) => file.name}
+          resetKey={path}
         >
           {#snippet row(file, index)}
             <div style="width: 100%; height: 100%;">
@@ -819,7 +917,7 @@
       y={contextMenu.y}
       onClose={() => contextMenu = null}
       items={[
-        { icon: 'open_in_new', label: m.files_action_open(), onClick: () => openFileEntry(contextMenu!.file), disabled: !contextMenu.file.is_directory && !contextMenu.file.is_link && contextMenu.file.size >= 25 * 1024 * 1024 },
+        { icon: 'open_in_new', label: m.files_action_open(), onClick: () => openFileEntry(contextMenu!.file), disabled: !contextMenu.file.is_directory && !contextMenu.file.is_link && contextMenu.file.size >= MAX_OPEN_BYTES },
         { icon: 'download', label: m.files_action_download(), onClick: () => setTimeout(downloadSelectedFiles, 10) },
         { icon: 'edit', label: m.files_action_rename(), onClick: () => setTimeout(renameSelectedFile, 10) },
         { icon: 'content_copy', label: m.files_action_duplicate(), onClick: () => setTimeout(duplicateSelectedFile, 10) },
@@ -834,6 +932,7 @@
 {#snippet fileRow(file: FileEntry, index: number)}
   {@const remotePath = filePath(file)}
   <button 
+    data-index={index}
     class="file-list-row {selectedFileSet.has(file.name) ? 'selected' : ''}" 
     onclick={event => selectFileEntry(event, file, index)} 
     ondblclick={() => openFileEntry(file)}
@@ -873,7 +972,8 @@
   <button 
     class="file-grid-card {selectedFileSet.has(file.name) ? 'selected' : ''}" 
     style="width: 100%; height: 100%; box-sizing: border-box;"
-    use:lazyLoadThumbnail={remotePath}
+    data-index={index}
+    use:lazyLoadThumbnail={{ path: remotePath, size: file.size }}
     onclick={event => selectFileEntry(event, file, index)} 
     ondblclick={() => openFileEntry(file)}
     oncontextmenu={e => handleContextMenu(e, file)}

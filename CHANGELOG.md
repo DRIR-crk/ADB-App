@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.5.0] - 2026-09-30
+
+### Added
+- Phones that open **Pair device with pairing code** on the same network are now detected automatically (mDNS, like Android Studio): they show up in the new *Pairing code* tab and as a notice anywhere in the app, so only the 6-digit code has to be typed. Android never broadcasts that code, so it cannot be detected. Can be turned off in Settings (*Detect pairing requests*).
+- After pairing, the device is connected automatically (adb's own auto-connect is given a moment, otherwise the phone's connection port is used).
+- Progress events for pairing, and localized messages for wrong code / unreachable device / not paired / expired QR.
+
+### Changed
+- New wireless dialog with three tabs: *Pairing code*, *QR* and *Manual*.
+- QR pairing was rewritten: crisp vector QR with a proper quiet zone, one cancellable session that waits up to 5 minutes (it used to regenerate every 30 seconds, and could loop forever on errors), and discovery that no longer depends on the exact text format of `adb mdns services`.
+- Much faster startup: the main JavaScript bundle went from 2.1 MB to 0.3 MB (device names, the debloat list and the QR generator are loaded on demand).
+- Device change events from `adb track-devices` are coalesced, and the tracker process is stopped when the app exits (it used to stay running and keep `adb.exe` locked).
+- Every adb command is killed if its caller is cancelled and never waits for input.
+- Updating or installing ADB / scrcpy always uses the app's managed folder (never an SDK or system directory), keeps a rollback copy, retries locked files on Windows and works across drives.
+- Much smaller permission set: `fs:default` was replaced by the two file permissions actually used.
+
+### Fixed
+- Installing APKs: failed installs were shown as successful; `xhdpi`/`xxhdpi`/`xxxhdpi` split APKs were never installed; only the preferred ABI of a bundle is installed now.
+- Sideload: the progress bar never moved, the button was only offered in a state where adb refuses sideload, and progress/cancel were lost when leaving the Home tab.
+- Files: the address bar listed the folder on every keystroke; Delete/Enter typed in the search box could delete the selected file; names with spaces, quotes, parentheses or backslashes; previews/thumbnails of such files; very large folders (sorting on every keystroke); unbounded thumbnail memory and requests; keyboard navigation below the first screen; downloads on macOS/Linux; old Android `ls` formats.
+- Apps: endless refresh loop when the list came back empty; uninstall / clear data reported success when they failed; apps without icon; double click also toggled the selection; stale metadata overwriting newer flags; filter counters.
+- Settings: saving any setting reverted a custom ADB/scrcpy path; moving the data folder could wipe it (it is now validated first and aborted on any error); the per-app language switch did nothing; Update was offered for system-installed tools.
+- Device selector: any key press on the disconnect button disconnected the device, and clicking it also selected that device.
+- Media volume always showed 7/15 below Android 16; text typed on the device was not shell-quoted; system page failed entirely when a single query was unsupported; brightness slider with adaptive brightness; slider jumping while dragging.
+- Transfer queue: removing a running transfer did not cancel it and retrying a running one started it twice.
+- App cleanup (temporary files, the adb tracker and, if enabled, the adb server) now also runs when the app exits without a window-close event, e.g. Cmd+Q on macOS.
+
+### Security
+- The webview can no longer ask the backend to delete an arbitrary folder (`close_app`), and file names coming from the device are sanitized and executable types are never opened directly.
+- Package names and permission names are validated before being used in device shell commands; the icon protocol only serves plain package names.
+
 ## [2.4.1] - 2026-07-19
 
 ### Changed

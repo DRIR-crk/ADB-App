@@ -12,14 +12,50 @@ use commands::devices;
 use commands::operations;
 use commands::queue;
 use commands::screenshot;
+use commands::wireless;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{Emitter, Manager};
+
+static EXIT_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Runs once when the app is going away (window close or `RunEvent::Exit`, which is the only
+/// event macOS delivers on Cmd+Q): stops the device tracker so no `adb track-devices` client is
+/// left running, removes temp files and, if configured, stops the adb server.
+fn exit_cleanup() {
+    if EXIT_CLEANUP_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    crate::adb::stop_tracker();
+
+    let temp_dir = crate::app_paths::cache_dir().join("temp");
+    let _ = std::fs::remove_dir_all(temp_dir);
+
+    let settings = crate::commands::operations::read_settings();
+    if settings.kill_adb_on_exit {
+        if let Some(path) = crate::tools::resolve_tool_path("adb") {
+            let _ = crate::process::command(path).arg("kill-server").status();
+        }
+    }
+}
+
+/// Package names only contain `[A-Za-z0-9._]`; anything else must never reach the filesystem.
+fn is_safe_icon_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+}
 
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .register_uri_scheme_protocol("adbapp", |_app, request| {
             let path = request.uri().path();
-            if let Some(package_name) = path.strip_prefix("/icon/") {
+            if let Some(package_name) = path
+                .strip_prefix("/icon/")
+                .filter(|name| is_safe_icon_name(name))
+            {
                 let cache_dir = crate::app_paths::cache_dir();
                 let icon_path = cache_dir
                     .join("app-icons")
@@ -66,6 +102,7 @@ pub fn run() {
 
             app.manage(queue::JobQueueState::default());
             queue::start_job_processor(app.handle().clone());
+            wireless::init(app.handle(), settings.pairing_detection);
 
             let mut settings_value = serde_json::to_value(&settings).unwrap_or_default();
             if let Some(settings_object) = settings_value.as_object_mut() {
@@ -151,15 +188,7 @@ pub fn run() {
                     return;
                 }
 
-                let temp_dir = crate::app_paths::cache_dir().join("temp");
-                let _ = std::fs::remove_dir_all(temp_dir);
-
-                let settings = crate::commands::operations::read_settings();
-                if settings.kill_adb_on_exit {
-                    if let Some(path) = crate::tools::resolve_tool_path("adb") {
-                        let _ = crate::process::command(path).arg("kill-server").status();
-                    }
-                }
+                exit_cleanup();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -179,12 +208,15 @@ pub fn run() {
             queue::get_jobs,
             operations::run_device_action,
             operations::run_device_action_batch,
-            operations::connect_wireless_device,
-            operations::disconnect_wireless_device,
-            operations::pair_wireless_device,
-            operations::generate_wireless_qr,
-            operations::pair_wireless_qr,
-            operations::connect_usb_over_tcpip,
+            wireless::connect_wireless_device,
+            wireless::disconnect_wireless_device,
+            wireless::pair_wireless_device,
+            wireless::start_wireless_qr,
+            wireless::cancel_wireless_qr,
+            wireless::connect_usb_over_tcpip,
+            wireless::wireless_discovery_acquire,
+            wireless::wireless_discovery_release,
+            wireless::wireless_discovery_snapshot,
             operations::get_system_state,
             operations::set_device_dark_mode,
             operations::get_media_volume,
@@ -226,6 +258,11 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             operations::open_store_review,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                exit_cleanup();
+            }
+        });
 }

@@ -25,7 +25,7 @@ pub async fn list_devices() -> Result<Vec<Device>, String> {
     if !result.ok() {
         return Err(format!("adb devices -l failed: {}", result.output));
     }
-    Ok(device_parser::parse_devices(&result.output))
+    Ok(device_parser::parse_devices(&result.stdout))
 }
 
 /// Get detailed information about a specific device.

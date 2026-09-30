@@ -125,12 +125,7 @@ fn normalize_candidate(tool: &str, value: &str) -> Option<PathBuf> {
     }
     let candidate = PathBuf::from(value);
     let candidate = if candidate.is_dir() {
-        let direct = candidate.join(executable_name(tool));
-        if direct.is_file() {
-            direct
-        } else {
-            direct
-        }
+        candidate.join(executable_name(tool))
     } else {
         candidate
     };
@@ -607,24 +602,27 @@ pub async fn tools_status_with_updates() -> ToolsStatus {
 }
 
 pub async fn install_or_update(tool: &str) -> Result<ToolsStatus, String> {
-    let current_path = resolve_tool_path(tool);
-    let target_dir = current_path.as_ref().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    // Always install into the managed directory: unpacking next to a system or third-party copy
+    // (Homebrew, an SDK, a package-manager shim folder) would clobber files the app does not own.
+    crate::dependencies::install_tool(tool).await?;
 
-    crate::dependencies::install_tool(tool, target_dir).await?;
-
-    let is_managed = current_path.as_ref().map_or(false, |p| p == &managed_executable(tool));
-    if current_path.is_none() || is_managed {
-        let mut config = read_config();
-        match tool {
-            "adb" => config.adb_path.clear(),
-            "scrcpy" => config.scrcpy_path.clear(),
-            _ => {}
-        }
-        let _ = crate::commands::operations::write_settings_sync(&config);
+    // Make the managed copy the active one; a configured (or auto-persisted) path elsewhere
+    // would otherwise keep winning over the binaries that were just installed.
+    let mut config = read_config();
+    let configured = match tool {
+        "adb" => &mut config.adb_path,
+        "scrcpy" => &mut config.scrcpy_path,
+        _ => return Err(format!("Unknown tool: {tool}")),
+    };
+    if !configured.is_empty() {
+        configured.clear();
+        crate::commands::operations::write_settings_sync(&config).map_err(|error| {
+            format!("{tool} was installed but the settings could not be updated: {error}")
+        })?;
     }
 
     invalidate_tools_cache();
-    Ok(tools_status())
+    Ok(tools_status_cached().await)
 }
 
 #[cfg(test)]

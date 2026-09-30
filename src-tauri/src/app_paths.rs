@@ -98,6 +98,28 @@ pub fn update_base_path(custom_parent_path: Option<&str>) {
     }
 }
 
+/// Data directory that `update_base_path(custom_parent_path)` would select, without applying it.
+pub fn planned_data_dir(custom_parent_path: Option<&str>) -> Option<PathBuf> {
+    let paths = PATHS.get()?.read().ok()?;
+    if paths.packaged {
+        return Some(paths.default_data.clone());
+    }
+    if let Some(parent) = custom_parent_path.map(str::trim).filter(|s| !s.is_empty()) {
+        let parent_path = PathBuf::from(parent);
+        if parent_path.is_dir() {
+            return Some(parent_path.join(&paths.identifier));
+        }
+    }
+    Some(paths.default_data.clone())
+}
+
+pub fn identifier() -> String {
+    PATHS
+        .get()
+        .and_then(|paths| paths.read().ok().map(|paths| paths.identifier.clone()))
+        .unwrap_or_default()
+}
+
 pub fn is_packaged() -> bool {
     PATHS
         .get()

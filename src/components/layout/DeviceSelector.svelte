@@ -3,7 +3,7 @@ import * as m from '../../paraglide/messages';
 
   import { onMount } from 'svelte';
   
-  import type { Device, DeviceDetails } from '../../context/devices.svelte';
+  import { isWirelessSerial, type Device, type DeviceDetails } from '../../context/devices.svelte';
   import MaterialIcon from '../MaterialIcon.svelte';
   import { getMarketingName } from '../../pages/workbench/utils';
 
@@ -68,7 +68,17 @@ import * as m from '../../paraglide/messages';
       : getShortDeviceName(selectedDevice))
     || (loading ? loadingLabel : emptyLabel)
   );
-  let connectionIcon = $derived(selectedDevice && (selectedDevice.serial.includes(':') || selectedDevice.serial.includes('._tcp')) ? 'wifi' : 'smartphone');
+  let connectionIcon = $derived(selectedDevice && isWirelessSerial(selectedDevice.serial) ? 'wifi' : 'smartphone');
+
+  function stateLabel(state: string) {
+    switch (state) {
+      case 'device': return m.state_connected();
+      case 'offline': return m.state_offline();
+      case 'unauthorized': return m.state_unauthorized();
+      case 'connecting': return m.state_connecting();
+      default: return state;
+    }
+  }
 
   onMount(() => {
     if (!menuElement || !anchorElement) return;
@@ -112,10 +122,30 @@ import * as m from '../../paraglide/messages';
     }
   }
 
-  function handleDisconnect(e: Event, serial: string) {
-    e.stopPropagation();
-    e.preventDefault();
-    if (onDisconnect) onDisconnect(serial);
+  // Native listeners on purpose: Svelte delegates on* handlers to the root, which runs after
+  // md-menu-item's internal click handler, so a delegated stopPropagation would still let the
+  // click select (and the menu close on) the device being disconnected.
+  function disconnectButton(node: HTMLElement, serial: string) {
+    let current = serial;
+    const onClick = (event: Event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      if (onDisconnect) onDisconnect(current);
+    };
+    const onKeydown = (event: KeyboardEvent) => {
+      // Only Enter/Space activate the button (native activation dispatches the click above);
+      // keep them from reaching the menu item, let arrows/Tab through for menu navigation.
+      if (event.key === 'Enter' || event.key === ' ') event.stopPropagation();
+    };
+    node.addEventListener('click', onClick);
+    node.addEventListener('keydown', onKeydown);
+    return {
+      update(next: string) { current = next; },
+      destroy() {
+        node.removeEventListener('click', onClick);
+        node.removeEventListener('keydown', onKeydown);
+      },
+    };
   }
 </script>
 
@@ -134,7 +164,7 @@ import * as m from '../../paraglide/messages';
     <MaterialIcon name={selectedDevice ? connectionIcon : 'devices'} />
     <span class="topbar-device-picker__label">{label}</span>
     {#if selectedDevice}
-      <span class="topbar-device-picker__status {selectedDevice.state === 'device' ? 'connected' : ''}" aria-label={selectedDevice.state}></span>
+      <span class="topbar-device-picker__status {selectedDevice.state === 'device' ? 'connected' : ''}" aria-label={stateLabel(selectedDevice.state)}></span>
     {/if}
     <MaterialIcon name="arrow_drop_down" class="topbar-device-picker__arrow" />
     <md-ripple></md-ripple>
@@ -147,8 +177,8 @@ import * as m from '../../paraglide/messages';
     anchorCorner="end-start"
     menuCorner="start-start"
   >
-    {#each devices as device}
-      {@const isWireless = device.serial.includes(':') || device.serial.includes('._tcp')}
+    {#each devices as device (device.serial)}
+      {@const isWireless = isWirelessSerial(device.serial)}
       {@const deviceName = getDeviceName(device)}
       <md-menu-item
         class="topbar-device-picker__option"
@@ -158,13 +188,12 @@ import * as m from '../../paraglide/messages';
       >
         <MaterialIcon slot="start" name={isWireless ? 'wifi' : 'smartphone'} />
         <div slot="headline">{deviceName}</div>
-        <div slot="supporting-text">{device.serial} · {device.state}</div>
+        <div slot="supporting-text">{device.serial} · {stateLabel(device.state)}</div>
         
         {#if isWireless}
           <md-icon-button
             slot="end"
-            onpointerdown={(e: PointerEvent) => handleDisconnect(e, device.serial)}
-            onkeydown={(e: KeyboardEvent) => {handleDisconnect(e, device.serial)}}
+            use:disconnectButton={device.serial}
             title={m.topbar_wireless_disconnect()}
           >
             <MaterialIcon name="close" />

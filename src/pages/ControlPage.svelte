@@ -4,6 +4,8 @@
 
   import { onDestroy, onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { save } from '@tauri-apps/plugin-dialog';
+  import { writeTextFile } from '@tauri-apps/plugin-fs';
   import MaterialIcon from '../components/MaterialIcon.svelte';
   import { words, translateError } from './workbench/utils';
   import type { ControlState, SoundMode } from './workbench/types';
@@ -32,6 +34,13 @@
   let loadingDeviceState = false;
   let loadQueued = false;
   let refreshInterval: number | undefined;
+  let lastSliderInputAt = 0;
+
+  const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  const hasNonAscii = (value: string) => /[^\x20-\x7e]/.test(value);
+  // `input text` solo acepta ASCII; los espacios van como %s y el resto se protege del shell del dispositivo
+  const encodeInputText = (value: string) => shellQuote(value.replace(/ /g, '%s'));
+  const markSliderActivity = () => { lastSliderInputAt = Date.now(); };
 
   async function loadDeviceState() {
     if (!serial) return;
@@ -47,8 +56,11 @@
     try {
       const value = await invoke<ControlState>('get_control_state', { serial });
       if (requestId !== loadRequestId) return;
-      controlBrightness = value.brightness;
-      controlVolume = value.volume_level;
+      // No pisar los sliders mientras el usuario los está moviendo
+      if (Date.now() - lastSliderInputAt > 1500) {
+        controlBrightness = value.brightness;
+        controlVolume = value.volume_level;
+      }
       controlVolumeMax = value.volume_maximum;
       rotationAuto = value.rotation_auto;
       rotation = value.rotation;
@@ -105,6 +117,19 @@
     }
   }
 
+  function applyBrightness(value: number) {
+    const safeValue = Math.max(0, Math.min(255, Math.round(value)));
+    controlBrightness = safeValue;
+    // Con brillo adaptativo activo el valor se ignora: se fuerza el modo manual en el mismo comando
+    return run(['shell', `settings put system screen_brightness_mode 0; settings put system screen_brightness ${safeValue}`]);
+  }
+
+  function sendInputText() {
+    if (!inputText) return;
+    if (hasNonAscii(inputText)) { status = m.control_input_asciiOnly(); return; }
+    run(['shell', 'input', 'text', encodeInputText(inputText)]);
+  }
+
   async function setDeviceRotation(value: number) {
     rotation = value;
     rotationAuto = false;
@@ -135,16 +160,16 @@
     input.click();
   }
 
-  function exportMacro() {
+  async function exportMacro() {
     if (!inputArgs) return;
-    const blob = new Blob([inputArgs], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'macro.txt';
-    a.click();
-    URL.revokeObjectURL(url);
-    status = m.control_macro_saved() || 'Macro saved successfully';
+    try {
+      const destination = await save({ defaultPath: 'macro.txt', filters: [{ name: 'Text', extensions: ['txt'] }] });
+      if (!destination) return;
+      await writeTextFile(destination, inputArgs);
+      status = m.control_macro_saved();
+    } catch (error: any) {
+      status = translateError(error);
+    }
   }
 
   async function runMacro() {
@@ -154,16 +179,23 @@
     try {
       for (const line of lines) {
         if (line.startsWith('sleep ')) {
-          const ms = parseInt(line.split(' ')[1]) || 1000;
-          await new Promise(r => setTimeout(r, ms));
-        } else {
-          const args = words(line);
-          if (['keyevent', 'text', 'tap', 'swipe', 'roll', 'press'].includes(args[0])) {
-            await run(['shell', 'input', ...args]);
-          } else {
-            await run(['shell', ...args]);
-          }
+          const ms = Number(line.split(/\s+/)[1]);
+          await new Promise(r => setTimeout(r, Number.isFinite(ms) && ms >= 0 ? ms : 1000));
+          continue;
         }
+        const args = words(line);
+        let result: string | undefined;
+        if (args[0] === 'text') {
+          const text = args.slice(1).join(' ');
+          if (hasNonAscii(text)) { status = m.control_input_asciiOnly(); break; }
+          result = await run(['shell', 'input', 'text', encodeInputText(text)]);
+        } else if (['keyevent', 'tap', 'swipe', 'roll', 'press'].includes(args[0])) {
+          result = await run(['shell', 'input', ...args]);
+        } else {
+          result = await run(['shell', ...args]);
+        }
+        // `run` devuelve undefined cuando falla: no seguir ejecutando la macro
+        if (result === undefined) break;
       }
     } catch (e: any) {
       status = e.message || String(e);
@@ -191,8 +223,10 @@
             min="0"
             max="255"
             value={controlBrightness}
-            oninput={(event: any) => controlBrightness = Number(event.target.value)}
-            onchange={(event: any) => run(['shell', 'settings', 'put', 'system', 'screen_brightness', String(event.target.value)])}
+            onpointerdown={markSliderActivity}
+            onpointermove={(event: PointerEvent) => { if (event.buttons) markSliderActivity(); }}
+            oninput={(event: any) => { markSliderActivity(); controlBrightness = Number(event.target.value); }}
+            onchange={(event: any) => applyBrightness(Number(event.target.value))}
           ></md-slider>
         </label>
 
@@ -206,7 +240,9 @@
             min="0"
             max={controlVolumeMax}
             value={controlVolume}
-            oninput={(event: any) => controlVolume = Number(event.target.value)}
+            onpointerdown={markSliderActivity}
+            onpointermove={(event: PointerEvent) => { if (event.buttons) markSliderActivity(); }}
+            oninput={(event: any) => { markSliderActivity(); controlVolume = Number(event.target.value); }}
             onchange={(event: any) => applyMediaVolume(Number(event.target.value))}
           ></md-slider>
         </label>
@@ -270,7 +306,7 @@
       <div class="md3-card-header">
         <h3>{m.control_input_title()}</h3>
       </div>
-      <form class="md3-text-form" onsubmit={event => { event.preventDefault(); if (inputText) run(['shell', 'input', 'text', inputText.replace(/ /g, '%s')]); }}>
+      <form class="md3-text-form" onsubmit={event => { event.preventDefault(); sendInputText(); }}>
         <md-outlined-text-field
           label={m.control_input_text()}
           use:materialTextFieldValue={inputText}
@@ -290,11 +326,11 @@
         <summary>{m.control_input_advanced()}</summary>
         <div class="md3-text-form" style="flex-direction: column">
           <md-chip-set style="margin-bottom: 8px">
-            <md-suggestion-chip label="+ Tap" onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'tap x y'}></md-suggestion-chip>
-            <md-suggestion-chip label="+ Swipe" onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'swipe x1 y1 x2 y2 duration'}></md-suggestion-chip>
-            <md-suggestion-chip label="+ Text" onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'text "hello"'}></md-suggestion-chip>
-            <md-suggestion-chip label="+ Key" onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'keyevent 26'}></md-suggestion-chip>
-            <md-suggestion-chip label="+ Sleep" onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'sleep 1000'}></md-suggestion-chip>
+            <md-suggestion-chip label={m.control_macro_addStep({ step: 'tap' })} onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'tap x y'}></md-suggestion-chip>
+            <md-suggestion-chip label={m.control_macro_addStep({ step: 'swipe' })} onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'swipe x1 y1 x2 y2 duration'}></md-suggestion-chip>
+            <md-suggestion-chip label={m.control_macro_addStep({ step: 'text' })} onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'text "hello"'}></md-suggestion-chip>
+            <md-suggestion-chip label={m.control_macro_addStep({ step: 'keyevent' })} onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'keyevent 26'}></md-suggestion-chip>
+            <md-suggestion-chip label={m.control_macro_addStep({ step: 'sleep' })} onclick={() => inputArgs = inputArgs + (inputArgs && !inputArgs.endsWith('\n') ? '\n' : '') + 'sleep 1000'}></md-suggestion-chip>
           </md-chip-set>
           <div style="display: flex; gap: 8px; width: 100%">
             <md-outlined-text-field
@@ -355,7 +391,7 @@
         </button>
         <div class="md3-volume-pill">
           <button onclick={() => applyMediaVolume(controlVolume - 1)}><MaterialIcon name="remove" /></button>
-          <div class="volume-label"><span>{controlVolume}</span><small>VOL</small></div>
+          <div class="volume-label"><span>{controlVolume}</span><small>{m.control_screenSound_volume()}</small></div>
           <button onclick={() => applyMediaVolume(controlVolume + 1)}><MaterialIcon name="add" /></button>
         </div>
       </div>

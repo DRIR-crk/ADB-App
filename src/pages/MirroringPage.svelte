@@ -25,7 +25,7 @@ import * as m from '../paraglide/messages';
     cameraWidth: string;
     cameraHeight: string;
     cameras: string[];
-    onRefreshData: () => void;
+    onRefreshData: (force?: boolean) => void;
     onLaunch: () => void;
     onDirectLaunch: (args: string) => void;
   }
@@ -188,7 +188,7 @@ import * as m from '../paraglide/messages';
             <MaterialIcon name="photo_camera" filled />
             <h3>{m.mirror_camera_title()}</h3>
             <div class="mirror-material-spacer"></div>
-            <md-icon-button title={m.mirror_camera_refresh()} onclick={onRefreshData}>
+            <md-icon-button title={m.mirror_camera_refresh()} onclick={() => onRefreshData(true)}>
               <MaterialIcon name="refresh" />
             </md-icon-button>
           </header>

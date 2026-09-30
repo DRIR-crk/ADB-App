@@ -1,4 +1,5 @@
 <script lang="ts">
+  import * as m from '../paraglide/messages';
   import { themeState } from '../context/theme.svelte';
 
   let { size = 24, color = undefined } = $props<{
@@ -19,7 +20,7 @@
   height={size}
   viewBox="12 11.5 76 78"
   role="img"
-  aria-label="Cute ghost app logo"
+  aria-label={m.topbar_logo_alt()}
   preserveAspectRatio="xMidYMid meet"
   data-tauri-drag-region
   xmlns="http://www.w3.org/2000/svg"

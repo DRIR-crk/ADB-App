@@ -51,6 +51,8 @@ import * as m from '../../paraglide/messages';
 
   function handleOctalInput(e: any) {
     let val = e.target.value.replace(/[^0-7]/g, '').slice(0, 3);
+    // Keep the field in sync when characters were dropped, otherwise it keeps showing the rejected input
+    if (e.target.value !== val) e.target.value = val;
     octal = val;
     errorText = '';
   }

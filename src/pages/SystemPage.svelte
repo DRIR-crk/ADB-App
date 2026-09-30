@@ -23,13 +23,15 @@ import * as m from '../paraglide/messages';
   let userToDelete = $state<string | null>(null);
   let selectedKeyboard = $state('');
 
+  const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+
   type AdvancedOption = {
     id: string;
     title: string;
     description: string;
     isRecommended: (deviceType?: string) => boolean;
     value: boolean;
-    onToggle: () => void;
+    onToggle: (event: Event) => void;
     onReset?: () => void;
   };
 
@@ -59,16 +61,25 @@ import * as m from '../paraglide/messages';
       await invoke<string>('run_device_action', { serial, args });
       await refreshSystemState();
     } catch (error) {
-      status = String(error);
+      // Re-sincroniza los switches con el estado real del dispositivo y conserva el error
+      const message = String(error);
+      await refreshSystemState();
+      status = message;
     } finally {
       systemLoading = false;
     }
   }
 
+  function toggleSwitch(event: Event, current: boolean, args: string[]) {
+    // md-switch se invierte solo al pulsar: se deja como estaba y el refresco decide el estado final
+    (event.currentTarget as any).selected = current;
+    applySystemAction(args);
+  }
+
   async function createSystemUser() {
     const name = newSystemUser.trim();
     if (!name) return status = m.system_error_noUserName();
-    await applySystemAction(['shell', 'pm', 'create-user', name]);
+    await applySystemAction(['shell', 'pm', 'create-user', shellQuote(name)]);
     newSystemUser = '';
   }
 
@@ -94,12 +105,12 @@ import * as m from '../paraglide/messages';
       description: m.system_advanced_captivePortalDesc(),
       isRecommended: (type?: string) => type === 'watch',
       value: systemState?.captive_portal_mode !== '0',
-      onToggle: () => {
+      onToggle: (event: Event) => {
         const isCurrentlyDisabled = systemState?.captive_portal_mode === '0';
-        const actionArgs = isCurrentlyDisabled 
-          ? ['shell', 'settings', 'put', 'global', 'captive_portal_mode', '1'] 
+        const actionArgs = isCurrentlyDisabled
+          ? ['shell', 'settings', 'put', 'global', 'captive_portal_mode', '1']
           : ['shell', 'settings', 'put', 'global', 'captive_portal_mode', '0'];
-        applySystemAction(actionArgs);
+        toggleSwitch(event, !isCurrentlyDisabled, actionArgs);
       },
       onReset: () => {
         applySystemAction(['shell', 'settings', 'delete', 'global', 'captive_portal_mode']);
@@ -137,7 +148,7 @@ import * as m from '../paraglide/messages';
             <MaterialIcon name="person" size={20} />
             <div class="md-item-content">
               <strong>{user.name || m.system_users_defaultName({ id: String(user.id) })}</strong>
-              <small>ID: {user.id}</small>
+              <small>{m.system_users_idLabel({ id: String(user.id) })}</small>
             </div>
             
             {#if isCurrent}
@@ -191,8 +202,8 @@ import * as m from '../paraglide/messages';
         </div>
         <md-switch 
           selected={systemState?.app_languages_enabled ?? false}
-          onclick={() => applySystemAction(
-            ['shell', 'settings', 'put', 'global', 'settings_app_locale_opt_in_enabled', systemState?.app_languages_enabled ? '0' : '1']
+          onchange={(event: Event) => toggleSwitch(event, systemState?.app_languages_enabled ?? false,
+            ['shell', 'settings', 'put', 'global', 'settings_app_locale_opt_in_enabled', systemState?.app_languages_enabled ? '1' : '0']
           )}
         ></md-switch>
       </div>
@@ -204,8 +215,10 @@ import * as m from '../paraglide/messages';
         </div>
         <md-switch 
           selected={systemState?.gestural_navigation ?? false}
-          onclick={() => applySystemAction(
-            ['shell', 'cmd', 'overlay', systemState?.gestural_navigation ? 'disable' : 'enable', 'com.android.internal.systemui.navbar.gestural']
+          onchange={(event: Event) => toggleSwitch(event, systemState?.gestural_navigation ?? false,
+            systemState?.gestural_navigation
+              ? ['shell', 'cmd', 'overlay', 'disable', 'com.android.internal.systemui.navbar.gestural']
+              : ['shell', 'cmd', 'overlay', 'enable-exclusive', '--category', 'com.android.internal.systemui.navbar.gestural']
           )}
         ></md-switch>
       </div>
@@ -307,7 +320,7 @@ import * as m from '../paraglide/messages';
             {/if}
             <md-switch 
               selected={option.value}
-              onclick={option.onToggle}
+              onchange={option.onToggle}
             ></md-switch>
           </div>
         </div>

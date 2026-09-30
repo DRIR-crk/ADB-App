@@ -1,7 +1,7 @@
 <script lang="ts">
 import * as m from '../../paraglide/messages';
 
-  import { type Snippet } from 'svelte';
+  import { tick, type Snippet } from 'svelte';
   
   import AppModal from './AppModal.svelte';
 
@@ -31,11 +31,14 @@ import * as m from '../../paraglide/messages';
   let finalCancelText = $derived(cancelText || m.common_cancel());
   let errorText = $state('');
   let submitting = $state(false);
+  let confirmButton: HTMLElement | undefined = $state();
 
   $effect(() => {
     if (open) {
       errorText = '';
       submitting = false;
+      // Llevar el foco al botón de confirmar: así Enter actúa sobre el botón enfocado y no sobre el elemento de fondo
+      tick().then(() => confirmButton?.focus());
     }
   });
 
@@ -59,10 +62,12 @@ import * as m from '../../paraglide/messages';
   import { onMount } from 'svelte';
   onMount(() => {
     const handleEnter = (event: KeyboardEvent) => {
-      if (open && event.key === 'Enter') {
-        event.preventDefault();
-        handleConfirm();
-      }
+      if (!open || event.key !== 'Enter' || event.defaultPrevented) return;
+      // Los botones del pie (Cancelar/Confirmar) gestionan su propio Enter; si no, Enter sobre "Cancelar" confirmaría
+      const origin = event.target instanceof Element ? event.target : null;
+      if (origin?.closest('.app-modal__actions')) return;
+      event.preventDefault();
+      handleConfirm();
     };
     window.addEventListener('keydown', handleEnter);
     return () => window.removeEventListener('keydown', handleEnter);
@@ -82,7 +87,8 @@ import * as m from '../../paraglide/messages';
   {/if}
   
   {#snippet actions()}
-    <md-filled-button 
+    <md-filled-button
+      bind:this={confirmButton}
       disabled={submitting ? true : undefined}
       onclick={handleConfirm}
       class={isDanger ? 'md-btn-danger' : ''}

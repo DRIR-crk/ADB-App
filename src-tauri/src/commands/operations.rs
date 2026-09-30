@@ -7,7 +7,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rand::{distr::Alphanumeric, RngExt};
 use serde::{Deserialize, Serialize};
 
 use crate::adb;
@@ -84,18 +83,31 @@ pub struct ControlState {
     pub sound_mode: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct WirelessQrPayload {
-    pub service_name: String,
-    pub password: String,
-    pub qr_data: String,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct AppInstallOptions {
     pub replace_existing: bool,
     pub grant_runtime_permissions: bool,
     pub bypass_low_target_sdk_block: bool,
+}
+
+/// Android package and permission names only contain `[A-Za-z0-9._]`. Names are interpolated
+/// into device shell strings, so anything else is refused instead of escaped.
+fn validate_android_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 256
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("Invalid package or permission name: {name}"))
+    }
+}
+
+/// Single-quotes a value for the device shell (`it's` -> `'it'\''s'`).
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 fn refs(values: &[String]) -> Vec<&str> {
@@ -133,6 +145,8 @@ pub struct AppSettings {
     pub cache_enabled: bool,
     pub cache_path: String,
     pub kill_adb_on_exit: bool,
+    /// Detect phones that open "Pair device with pairing code" (mDNS) while the app is open.
+    pub pairing_detection: bool,
     pub auto_save_screenshots: bool,
     pub material_you_enabled: bool,
     pub material_you_background_tint: bool,
@@ -149,6 +163,7 @@ impl Default for AppSettings {
             cache_enabled: true,
             cache_path: String::new(),
             kill_adb_on_exit: true,
+            pairing_detection: true,
             auto_save_screenshots: false,
             material_you_enabled: true,
             material_you_background_tint: true,
@@ -207,6 +222,29 @@ pub fn write_settings_sync(settings: &AppSettings) -> Result<(), String> {
     Ok(())
 }
 
+/// Old data directory waiting to be deleted by `close_app` once the app restarts. Kept on the
+/// backend so the webview can never ask for an arbitrary directory to be wiped.
+static PENDING_OLD_DATA_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Validates a new cache/data location before anything is changed and returns the data
+/// directory it will use.
+fn validate_new_data_dir(cache_path: &str, old_data_dir: &Path) -> Result<PathBuf, String> {
+    let requested = cache_path.trim();
+    if !requested.is_empty() && !Path::new(requested).is_dir() {
+        return Err(format!("The folder does not exist: {requested}"));
+    }
+    let planned = crate::app_paths::planned_data_dir((!requested.is_empty()).then_some(requested))
+        .ok_or_else(|| "The app paths are not initialized".to_string())?;
+    if planned != old_data_dir
+        && (planned.starts_with(old_data_dir) || old_data_dir.starts_with(&planned))
+    {
+        return Err(
+            "The new location cannot be inside the current data folder, or contain it".to_string(),
+        );
+    }
+    Ok(planned)
+}
+
 #[tauri::command]
 pub async fn save_app_settings(
     window: tauri::WebviewWindow,
@@ -218,43 +256,74 @@ pub async fn save_app_settings(
     if crate::app_paths::is_packaged() {
         settings.cache_path.clear();
     }
+    // Tool paths are owned by `set_tool_path` and the installer: a stale copy held by the UI
+    // must never overwrite them.
+    settings.adb_path = old_settings.adb_path.clone();
+    settings.scrcpy_path = old_settings.scrcpy_path.clone();
+
+    let path_changed = old_settings.cache_path != settings.cache_path;
+    // Validate the new location before touching settings, adb or any file.
+    let planned_data_dir = if path_changed {
+        Some(validate_new_data_dir(&settings.cache_path, &old_data_dir)?)
+    } else {
+        None
+    };
 
     write_settings_sync(&settings)?;
     if old_settings.window_effect != settings.window_effect {
         apply_window_effect(&window, &settings.window_effect);
     }
+    if old_settings.pairing_detection != settings.pairing_detection {
+        crate::commands::wireless::set_background(
+            tauri::Manager::app_handle(&window),
+            settings.pairing_detection,
+        );
+    }
 
-    let path_changed = old_settings.cache_path != settings.cache_path;
+    let Some(new_data_dir) = planned_data_dir else {
+        return Ok(None);
+    };
+    let custom_path = |value: &str| (!value.trim().is_empty()).then(|| value.to_string());
 
-    if path_changed {
-        let _ = crate::adb::run_adb(&["kill-server"]).await;
-        #[cfg(windows)]
-        let _ = crate::process::command("taskkill")
-            .args(["/F", "/IM", "scrcpy.exe"])
-            .output();
-        #[cfg(not(windows))]
-        let _ = crate::process::command("killall").arg("scrcpy").output();
+    if new_data_dir == old_data_dir {
+        crate::app_paths::update_base_path(custom_path(&settings.cache_path).as_deref());
+        return Ok(None);
+    }
 
-        crate::app_paths::update_base_path(if !settings.cache_path.trim().is_empty() {
-            Some(&settings.cache_path)
-        } else {
-            None
-        });
+    let _tracker_pause = crate::adb::TrackerPause::new();
+    let _ = crate::adb::kill_server().await;
+    #[cfg(windows)]
+    let _ = crate::process::command("taskkill")
+        .args(["/F", "/IM", "scrcpy.exe"])
+        .output();
+    #[cfg(not(windows))]
+    let _ = crate::process::command("killall").arg("scrcpy").output();
 
-        let new_data_dir = crate::app_paths::data_dir();
+    crate::app_paths::update_base_path(custom_path(&settings.cache_path).as_deref());
+    // Tool locations depend on the data folder: forget the cached ones so adb is never respawned
+    // from the folder that is about to be deleted.
+    crate::tools::invalidate_tools_cache();
 
-        if old_data_dir != new_data_dir {
-            if old_data_dir.exists() {
-                fs::create_dir_all(&new_data_dir).map_err(|e| e.to_string())?;
-                if let Err(e) = move_directory_contents(&old_data_dir, &new_data_dir) {
-                    eprintln!("Error moving directory: {}", e);
-                }
-            }
-            return Ok(Some(old_data_dir.to_string_lossy().into_owned()));
+    if old_data_dir.exists() {
+        let moved = fs::create_dir_all(&new_data_dir)
+            .map_err(|error| error.to_string())
+            .and_then(|_| move_directory_contents(&old_data_dir, &new_data_dir));
+        if let Err(error) = moved {
+            // Keep using the old location: nothing was deleted, so nothing is lost.
+            settings.cache_path = old_settings.cache_path.clone();
+            let _ = write_settings_sync(&settings);
+            crate::app_paths::update_base_path(custom_path(&old_settings.cache_path).as_deref());
+            crate::tools::invalidate_tools_cache();
+            return Err(format!("Could not move the app data: {error}"));
         }
     }
 
-    Ok(None)
+    if let Ok(mut pending) = PENDING_OLD_DATA_DIR.lock() {
+        *pending = Some(old_data_dir.clone());
+    }
+    // The app exits right after (`close_app`): keep the tracker from starting an adb server again.
+    crate::adb::stop_tracker();
+    Ok(Some(old_data_dir.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]
@@ -289,24 +358,30 @@ pub async fn save_device_wallpaper_to_disk(
         return Err(format!("Failed to extract wallpaper: {}", result.output));
     }
 
-    let output = result.output;
-    if let (Some(start_idx), Some(end_idx)) =
-        (output.find("WALLPAPER_START"), output.find("WALLPAPER_END"))
-    {
-        let mut base64 = output[start_idx + 15..end_idx].to_string();
-        base64.retain(|c| !c.is_ascii_whitespace());
-        if !base64.is_empty() {
-            use base64::Engine;
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&base64)
-                .map_err(|e| format!("Base64 decode error: {}", e))?;
-            std::fs::write(&path, decoded)
-                .map_err(|e| format!("Failed to write wallpaper to disk: {}", e))?;
-            return Ok(());
-        }
+    if let Some(base64) = wallpaper_payload(&result.output) {
+        let decoded = STANDARD
+            .decode(&base64)
+            .map_err(|e| format!("Base64 decode error: {}", e))?;
+        std::fs::write(&path, decoded)
+            .map_err(|e| format!("Failed to write wallpaper to disk: {}", e))?;
+        return Ok(());
     }
 
     Err("Extractor did not return encoded image.".to_string())
+}
+
+/// Base64 payload printed by the wallpaper extractor between its start/end markers, without
+/// whitespace. Returns `None` when the markers are missing, out of order or the payload is empty.
+fn wallpaper_payload(output: &str) -> Option<String> {
+    const START: &str = "WALLPAPER_START";
+    const END: &str = "WALLPAPER_END";
+    let start = output.find(START)? + START.len();
+    let end = output[start..].find(END)? + start;
+    let payload: String = output[start..end]
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    (!payload.is_empty()).then_some(payload)
 }
 
 #[tauri::command]
@@ -338,20 +413,8 @@ pub async fn get_device_wallpaper(app: tauri::AppHandle, serial: String) -> Resu
         return Err(format!("Failed to extract wallpaper: {}", result.output));
     }
 
-    let output = result.output;
-    if let (Some(start_idx), Some(end_idx)) =
-        (output.find("WALLPAPER_START"), output.find("WALLPAPER_END"))
-    {
-        let base64 = output[start_idx + 15..end_idx]
-            .replace("\r", "")
-            .replace("\n", "")
-            .replace(" ", "");
-        if !base64.is_empty() {
-            return Ok(base64);
-        }
-    }
-
-    Err("Extractor did not return encoded image.".to_string())
+    wallpaper_payload(&result.output)
+        .ok_or_else(|| "Extractor did not return encoded image.".to_string())
 }
 
 #[tauri::command]
@@ -516,17 +579,33 @@ fn get_windows_build() -> u32 {
     }
 }
 
+/// Exits the app after a data-directory move, deleting the old directory recorded by
+/// `save_app_settings` (the `old_data_dir` argument sent by older frontends is ignored).
 #[tauri::command]
-pub async fn close_app(old_data_dir: String) -> Result<(), String> {
-    let old_dir_path = std::path::PathBuf::from(old_data_dir);
+pub async fn close_app() -> Result<(), String> {
+    let old_dir = PENDING_OLD_DATA_DIR
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take());
+    let identifier = crate::app_paths::identifier();
 
-    // Spawn a thread to perform cleanup and forcefully exit
+    // Cleanup runs on its own thread so the webview can be torn down while we retry.
     std::thread::spawn(move || {
-        for _ in 0..20 {
-            if !old_dir_path.exists() || std::fs::remove_dir_all(&old_dir_path).is_ok() {
-                break;
+        crate::adb::stop_tracker();
+        if let Some(old_dir) = old_dir {
+            // Only ever delete a directory that really is an app data directory.
+            let is_app_dir = !identifier.is_empty()
+                && old_dir
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy() == identifier.as_str());
+            if is_app_dir {
+                for _ in 0..20 {
+                    if !old_dir.exists() || std::fs::remove_dir_all(&old_dir).is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         std::process::exit(0);
     });
@@ -534,30 +613,35 @@ pub async fn close_app(old_data_dir: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Copies the app data to its new location. The WebView2 profile (`EBWebView`) is skipped: it is
+/// locked while the app runs and is recreated on the next start. Any copy error aborts the move.
+/// The source is left in place (the running app still uses it); `close_app` deletes it on exit.
 fn move_directory_contents(src: &Path, dst: &Path) -> Result<(), String> {
     if !src.exists() {
         return Ok(());
     }
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
-    while let Some((s, d)) = stack.pop() {
-        if !d.exists() {
-            fs::create_dir_all(&d)
-                .map_err(|e| format!("Failed to create dir {}: {}", d.display(), e))?;
-        }
-        for entry in
-            fs::read_dir(&s).map_err(|e| format!("Failed to read dir {}: {}", s.display(), e))?
-        {
+    while let Some((source_dir, target_dir)) = stack.pop() {
+        fs::create_dir_all(&target_dir)
+            .map_err(|e| format!("Failed to create dir {}: {}", target_dir.display(), e))?;
+        let entries = fs::read_dir(&source_dir)
+            .map_err(|e| format!("Failed to read dir {}: {}", source_dir.display(), e))?;
+        for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            if source_dir == src && name.to_string_lossy().eq_ignore_ascii_case("EBWebView") {
+                continue;
+            }
             let file_type = entry.file_type().map_err(|e| e.to_string())?;
-            let target = d.join(entry.file_name());
+            let target = target_dir.join(&name);
             if file_type.is_dir() {
                 stack.push((entry.path(), target));
             } else {
-                let _ = fs::copy(entry.path(), &target);
+                fs::copy(entry.path(), &target)
+                    .map_err(|e| format!("Failed to copy {}: {}", entry.path().display(), e))?;
             }
         }
     }
-    let _ = fs::remove_dir_all(src);
     Ok(())
 }
 
@@ -630,6 +714,81 @@ fn collect_apks(directory: &Path) -> Result<Vec<PathBuf>, String> {
     visit(directory, &mut result)?;
     result.sort();
     Ok(result)
+}
+
+/// Screen densities of split APKs (`config.xxhdpi.apk` -> 480). Longest markers first: `hdpi` is a
+/// substring of `xhdpi`, `xxhdpi` and `xxxhdpi`.
+const DENSITY_MARKERS: [(&str, i32); 6] = [
+    ("xxxhdpi", 640),
+    ("xxhdpi", 480),
+    ("xhdpi", 320),
+    ("hdpi", 240),
+    ("mdpi", 160),
+    ("ldpi", 120),
+];
+
+/// ABIs of split APKs in canonical (hyphenated) form, longest markers first.
+const ABI_MARKERS: [&str; 6] = [
+    "arm64-v8a",
+    "armeabi-v7a",
+    "armeabi",
+    "x86-64",
+    "x86_64",
+    "x86",
+];
+
+/// True when `needle` appears in `haystack` as a whole token (not glued to other letters/digits).
+fn contains_token(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(start, _)| {
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[start + needle.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+    })
+}
+
+fn apk_density(filename: &str) -> Option<i32> {
+    DENSITY_MARKERS
+        .iter()
+        .find(|(marker, _)| contains_token(filename, marker))
+        .map(|(_, density)| *density)
+}
+
+/// `arm64_v8a` / `arm64-v8a` -> `arm64-v8a`; `x86_64` -> `x86_64` (adb's spelling for that ABI).
+fn canonical_abi(name: &str) -> String {
+    let name = name.trim().to_ascii_lowercase().replace('_', "-");
+    if name == "x86-64" {
+        "x86_64".to_string()
+    } else {
+        name
+    }
+}
+
+fn apk_abi(filename: &str) -> Option<String> {
+    let normalized = filename.replace('_', "-");
+    ABI_MARKERS
+        .iter()
+        .find(|marker| contains_token(&normalized, &marker.replace('_', "-")))
+        .map(|marker| canonical_abi(marker))
+}
+
+/// Closest available density to the device's (ties go to the higher one, which scales down).
+fn closest_density(device_density: i32, available: &[i32]) -> Option<i32> {
+    if device_density <= 0 {
+        return None;
+    }
+    available
+        .iter()
+        .copied()
+        .min_by_key(|density| ((device_density - density).abs(), -density))
+}
+
+/// The device's most preferred ABI (`abilist` order) that is present among the split APKs.
+fn preferred_abi(device_abis: &[String], available: &[String]) -> Option<String> {
+    device_abis
+        .iter()
+        .map(|abi| canonical_abi(abi))
+        .find(|abi| available.contains(abi))
 }
 
 fn resolve_install_files(
@@ -778,18 +937,6 @@ fn resolve_install_files(
             }
         }
 
-        let known_abi_markers = [
-            "arm64_v8a",
-            "armeabi_v7a",
-            "armeabi",
-            "x86_64",
-            "x86",
-            "mips",
-        ];
-
-        let known_density_markers = ["ldpi", "mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"];
-        let density_values = [120, 160, 240, 320, 480, 640];
-
         let known_language_codes = [
             "af", "sq", "ar", "hy", "az", "eu", "be", "bn", "bs", "bg", "ca", "zh", "hr", "cs",
             "da", "nl", "en", "et", "fi", "fr", "gl", "ka", "de", "el", "gu", "ht", "he", "hi",
@@ -800,75 +947,35 @@ fn resolve_install_files(
 
         let all_apks = collect_apks(&extraction_directory)?;
 
-        // Buscar la densidad más cercana disponible en el ZIP
-        let mut available_densities = Vec::new();
-        for apk in &all_apks {
-            let filename = apk
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase();
-            for (i, marker) in known_density_markers.iter().enumerate() {
-                if filename.contains(marker) && !available_densities.contains(&i) {
-                    available_densities.push(i);
-                }
-            }
-        }
-        let mut target_density_marker = "";
-        if device_density > 0 && !available_densities.is_empty() {
-            let mut closest_idx = available_densities[0];
-            let mut min_diff = (device_density - density_values[closest_idx]).abs();
-            for &idx in &available_densities {
-                let diff = (device_density - density_values[idx]).abs();
-                if diff < min_diff {
-                    min_diff = diff;
-                    closest_idx = idx;
-                }
-            }
-            target_density_marker = known_density_markers[closest_idx];
-        }
+        // The density and ABI of the device decide which split APKs are installed.
+        let apk_names: Vec<String> = all_apks
+            .iter()
+            .map(|apk| {
+                apk.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase()
+            })
+            .collect();
+        let available_densities: Vec<i32> = apk_names.iter().filter_map(|name| apk_density(name)).collect();
+        let target_density = closest_density(device_density, &available_densities);
+        let available_abis: Vec<String> = apk_names.iter().filter_map(|name| apk_abi(name)).collect();
+        // Only the most preferred ABI is installed (the others would just waste storage).
+        let target_abi = preferred_abi(&supported_abis, &available_abis);
 
         let mut filtered_apks = Vec::new();
 
         // 4. Filtrar los APKs extraídos
-        for apk in all_apks {
-            let filename = apk
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase();
-
+        for (apk, filename) in all_apks.into_iter().zip(apk_names) {
             // --- Filtro de Arquitectura (ABI) ---
-            let mut is_abi_split = false;
-            let mut matches_device_abi = false;
-            for marker in &known_abi_markers {
-                if filename.contains(marker) || filename.contains(&marker.replace('_', "-")) {
-                    is_abi_split = true;
-                    for supported_abi in &supported_abis {
-                        let normalized_supported = supported_abi.replace('-', "_");
-                        if filename.contains(&normalized_supported)
-                            || filename.contains(supported_abi)
-                        {
-                            matches_device_abi = true;
-                            break;
-                        }
-                    }
-                    break;
-                }
-            }
+            let apk_abi_name = apk_abi(&filename);
+            let is_abi_split = apk_abi_name.is_some();
+            let matches_device_abi = apk_abi_name.is_some() && apk_abi_name == target_abi;
 
             // --- Filtro de Densidad ---
-            let mut is_density_split = false;
-            let mut matches_device_density = false;
-            for marker in &known_density_markers {
-                if filename.contains(marker) {
-                    is_density_split = true;
-                    if target_density_marker.is_empty() || marker == &target_density_marker {
-                        matches_device_density = true;
-                    }
-                    break;
-                }
-            }
+            let apk_density_value = apk_density(&filename);
+            let is_density_split = apk_density_value.is_some();
+            let matches_device_density = target_density.is_none() || apk_density_value == target_density;
 
             // --- Filtro de Idioma ---
             let mut is_lang_split = false;
@@ -1108,15 +1215,64 @@ pub async fn run_device_action_batch(
     Ok(output.trim().to_string())
 }
 
+/// Extracts the percentage from adb's sideload progress line: `serving: 'ota.zip'  (~47%)`.
+/// The file name may contain digits, parentheses or percent signs, so only the last `(~` counts.
+fn parse_sideload_progress(line: &str) -> Option<u32> {
+    let rest = &line[line.rfind("(~")? + 2..];
+    let percent = rest[..rest.find('%')?].trim();
+    percent.parse::<u32>().ok().filter(|value| *value <= 100)
+}
+
+/// Reads an adb output stream to the end, emitting `sideload-progress` whenever the progress changes.
+async fn read_sideload_stream<R>(mut reader: R, app: tauri::AppHandle) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tauri::Emitter;
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = [0u8; 1024];
+    let mut full_log = String::new();
+    let mut current_line = String::new();
+    let mut last_progress = None;
+    let mut report = |line: &str| {
+        if let Some(progress) = parse_sideload_progress(line) {
+            if last_progress != Some(progress) {
+                last_progress = Some(progress);
+                let _ = app.emit("sideload-progress", progress);
+            }
+        }
+    };
+
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let text = String::from_utf8_lossy(&buf[..n]);
+                full_log.push_str(&text);
+                for c in text.chars() {
+                    if c == '\r' || c == '\n' {
+                        report(&current_line);
+                        current_line.clear();
+                    } else {
+                        current_line.push(c);
+                    }
+                }
+                // The progress line is refreshed in place, so also look at the unfinished line.
+                report(&current_line);
+            }
+        }
+    }
+    full_log
+}
+
 #[tauri::command]
 pub async fn sideload_device(
     app: tauri::AppHandle,
     serial: String,
     file_path: String,
 ) -> Result<String, String> {
-    use tauri::Emitter;
     use tauri::Listener;
-    use tokio::io::AsyncReadExt;
 
     let adb_path = crate::tools::resolve_tool_path("adb")
         .ok_or_else(|| "ADB is not installed. Configure or install it in Settings.".to_string())?;
@@ -1133,60 +1289,15 @@ pub async fn sideload_device(
         .spawn()
         .map_err(|e| format!("Failed to start adb sideload: {}", e))?;
 
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill().await;
+        return Err("Failed to capture adb sideload output".to_string());
+    };
 
-    let app_clone = app.clone();
-
-    // Task to read stdout
-    let stdout_handle = tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
-        let mut full_log = String::new();
-        let mut current_line = String::new();
-
-        loop {
-            match stdout.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let text = String::from_utf8_lossy(&buf[0..n]);
-                    full_log.push_str(&text);
-
-                    for c in text.chars() {
-                        if c == '\r' || c == '\n' {
-                            if current_line.contains("serving:") {
-                                if let Some(start) = current_line.find("serving: ") {
-                                    let rest = &current_line[start + 9..];
-                                    if let Some(end) = rest.find('%') {
-                                        let pct_str = &rest[..end];
-                                        if let Ok(pct) = pct_str.parse::<u32>() {
-                                            let _ = app_clone.emit("sideload-progress", pct);
-                                        }
-                                    }
-                                }
-                            }
-                            current_line.clear();
-                        } else {
-                            current_line.push(c);
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        full_log
-    });
-
-    let stderr_handle = tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
-        let mut full_log = String::new();
-        while let Ok(n) = stderr.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-            full_log.push_str(&String::from_utf8_lossy(&buf[0..n]));
-        }
-        full_log
-    });
+    // adb prints `serving: '<file>'  (~47%)` with carriage returns, on stdout or stderr
+    // depending on the version: follow both.
+    let stdout_handle = tokio::spawn(read_sideload_stream(stdout, app.clone()));
+    let stderr_handle = tokio::spawn(read_sideload_stream(stderr, app.clone()));
 
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let cancel_tx = std::sync::Mutex::new(Some(cancel_tx));
@@ -1218,162 +1329,6 @@ pub async fn sideload_device(
     } else {
         Err(combined)
     }
-}
-
-#[tauri::command]
-pub async fn connect_wireless_device(endpoint: String) -> Result<String, String> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() || !endpoint.contains(':') {
-        return Err("Please enter a valid IP address and port".to_string());
-    }
-    let result = adb::run_adb(&["connect", endpoint]).await?;
-    if result.ok() && !result.output.to_ascii_lowercase().contains("failed") {
-        Ok(result.output.trim().to_string())
-    } else {
-        Err(result.output.trim().to_string())
-    }
-}
-
-#[tauri::command]
-pub async fn disconnect_wireless_device(endpoint: String) -> Result<String, String> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        return Err("Please enter a valid device serial".to_string());
-    }
-    let result = adb::run_adb(&["disconnect", endpoint]).await?;
-    if result.ok() {
-        Ok(result.output.trim().to_string())
-    } else {
-        Err(result.output.trim().to_string())
-    }
-}
-
-#[tauri::command]
-pub async fn pair_wireless_device(endpoint: String, code: String) -> Result<String, String> {
-    let endpoint = endpoint.trim();
-    let code = code.trim();
-    if endpoint.is_empty() || !endpoint.contains(':') || code.is_empty() {
-        return Err("Please enter the endpoint and pairing code".to_string());
-    }
-    let result = adb::run_adb(&["pair", endpoint, code]).await?;
-    if result.ok() && !result.output.to_ascii_lowercase().contains("failed") {
-        Ok(result.output.trim().to_string())
-    } else {
-        Err(result.output.trim().to_string())
-    }
-}
-
-fn random_wireless_token(length: usize) -> String {
-    rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(length)
-        .map(char::from)
-        .collect::<String>()
-        .to_ascii_uppercase()
-}
-
-#[tauri::command]
-pub fn generate_wireless_qr() -> Result<WirelessQrPayload, String> {
-    let service_name = format!("adb-{}", random_wireless_token(8));
-    let password = random_wireless_token(12);
-    let payload = format!("WIFI:T:ADB;S:{service_name};P:{password};;");
-    Ok(WirelessQrPayload {
-        service_name,
-        password,
-        qr_data: payload,
-    })
-}
-
-#[tauri::command]
-pub async fn pair_wireless_qr(service_name: String, password: String) -> Result<String, String> {
-    if service_name.trim().is_empty() || password.trim().is_empty() {
-        return Err("Generate and scan a QR code first".to_string());
-    }
-    for _ in 0..30 {
-        let result = adb::run_adb(&["mdns", "services"]).await?;
-        if result.ok() {
-            for line in result.output.lines() {
-                /*
-                Tracking ADB issue where duplicate mdns entries appear with "(2)", "(3)", etc.
-                Tracking issue: https://issuetracker.google.com/issues/383769302
-                
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 && parts[1] == "_adb-tls-pairing._tcp" {
-                    if parts[0] == service_name.trim() {
-                        let endpoint = parts[2];
-                        return pair_wireless_device(endpoint.to_string(), password).await;
-                    }
-                }
-                */
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                
-                let (srv_name, srv_type, endpoint) = if parts.len() >= 4 && parts[1].starts_with('(') && parts[1].ends_with(')') {
-                    (parts[0], parts[2], parts[3])
-                } else if parts.len() >= 3 {
-                    (parts[0], parts[1], parts[2])
-                } else {
-                    continue;
-                };
-
-                if srv_type == "_adb-tls-pairing._tcp" && srv_name == service_name.trim() {
-                    return pair_wireless_device(endpoint.to_string(), password).await;
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    Err("Device not found. Generate another QR and scan it again.".to_string())
-}
-
-async fn wireless_host_for_serial(serial: &str) -> Result<String, String> {
-    let queries = [
-        (vec!["shell", "ip", "route", "show", "dev", "wlan0"], "src "),
-        (vec!["shell", "ip", "route"], "src "),
-        (
-            vec!["shell", "ip", "-f", "inet", "addr", "show", "wlan0"],
-            "inet ",
-        ),
-    ];
-
-    for (args, keyword) in queries {
-        let result = adb::run_adb_for_serial(serial, &args).await?;
-        if result.ok() {
-            for line in result.output.lines() {
-                if let Some(idx) = line.find(keyword) {
-                    let rest = &line[idx + keyword.len()..].trim_start();
-                    let ip_candidate = rest.split_whitespace().next().unwrap_or("");
-                    let parts: Vec<&str> = ip_candidate.split('.').collect();
-                    if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
-                        return Ok(ip_candidate.to_string());
-                    }
-                }
-            }
-        }
-    }
-    let property =
-        adb::run_adb_for_serial(serial, &["shell", "getprop", "dhcp.wlan0.ipaddress"]).await?;
-    let host = property.output.trim();
-    if property.ok() && !host.is_empty() {
-        Ok(host.to_string())
-    } else {
-        Err("Could not detect the Wi-Fi IP of the device".to_string())
-    }
-}
-
-#[tauri::command]
-pub async fn connect_usb_over_tcpip(serial: String) -> Result<String, String> {
-    if serial.contains(':') || serial.starts_with("emulator-") {
-        return Err("Select a physically connected USB device".to_string());
-    }
-    let host = wireless_host_for_serial(&serial).await?;
-    let tcpip = adb::run_adb_for_serial(&serial, &["tcpip", "5555"]).await?;
-    if !tcpip.ok() || tcpip.output.to_ascii_lowercase().contains("failed") {
-        return Err(tcpip.output.trim().to_string());
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
-    let endpoint = format!("{host}:5555");
-    connect_wireless_device(endpoint.clone()).await?;
-    Ok(endpoint)
 }
 
 async fn run_system_query(serial: &str, args: &[&str]) -> Result<String, String> {
@@ -1487,14 +1442,31 @@ pub async fn get_system_state(
             &["shell", "settings", "get", "global", "captive_portal_mode"],
         ),
     );
-    let users_output = users_output?;
-    let current_user_output = current_user_output?;
-    let app_languages_output = app_languages_output?;
-    let overlays_output = overlays_output?;
-    let all_keyboards_output = all_keyboards_output?;
-    let enabled_keyboards_output = enabled_keyboards_output?;
-    let current_keyboard_id = current_keyboard_id?;
-    let captive_portal_mode_output = captive_portal_mode_output?;
+    // One unsupported sub-query (e.g. `cmd overlay` before Android 8) must not hide the rest:
+    // the error is only reported when the device does not answer anything at all.
+    let answered = [
+        &users_output,
+        &current_user_output,
+        &app_languages_output,
+        &overlays_output,
+        &all_keyboards_output,
+        &enabled_keyboards_output,
+        &current_keyboard_id,
+        &captive_portal_mode_output,
+    ]
+    .iter()
+    .any(|result| result.is_ok());
+    if !answered {
+        return Err(users_output.err().unwrap_or_default());
+    }
+    let users_output = users_output.unwrap_or_default();
+    let current_user_output = current_user_output.unwrap_or_default();
+    let app_languages_output = app_languages_output.unwrap_or_default();
+    let overlays_output = overlays_output.unwrap_or_default();
+    let all_keyboards_output = all_keyboards_output.unwrap_or_default();
+    let enabled_keyboards_output = enabled_keyboards_output.unwrap_or_default();
+    let current_keyboard_id = current_keyboard_id.unwrap_or_default();
+    let captive_portal_mode_output = captive_portal_mode_output.unwrap_or_default();
 
     let current_user_id = last_integer(&current_user_output).unwrap_or(-1);
     let mut all_keyboard_ids = parse_keyboard_ids(&all_keyboards_output);
@@ -1621,24 +1593,56 @@ pub async fn set_device_dark_mode(
     }
 }
 
+/// `AudioManager.getStreamVolume(3) -> 7` (`cmd audio`, Android 16+) -> 7
+fn parse_cmd_audio_value(output: &str) -> Option<i32> {
+    output
+        .split_once("->")
+        .and_then(|(_, value)| value.trim().parse().ok())
+}
+
+/// `[v] volume is 7 in range [0..15]` (`media volume --get`, every Android version) -> (7, 15)
+fn parse_media_volume(output: &str) -> Option<(i32, i32)> {
+    let digits = |text: &str| {
+        text.trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<i32>()
+            .ok()
+    };
+    let rest = output.split("volume is ").nth(1)?;
+    Some((digits(rest)?, digits(rest.split("..").nth(1)?)?))
+}
+
+/// Current and maximum media volume. `cmd audio get-stream-volume` only exists on Android 16+
+/// and prints an error without digits on older versions, so `media volume` is the fallback.
+fn resolve_media_volume(level_output: &str, max_output: &str, media_output: &str) -> Option<(i32, i32)> {
+    match (parse_cmd_audio_value(level_output), parse_cmd_audio_value(max_output)) {
+        (Some(level), Some(maximum)) if maximum > 0 => Some((level, maximum)),
+        _ => parse_media_volume(media_output).filter(|(_, maximum)| *maximum > 0),
+    }
+}
+
+const MEDIA_VOLUME_SCRIPT: &str = "cmd audio get-stream-volume 3 2>/dev/null; echo '---ADBAPPSEP---'; cmd audio get-max-volume 3 2>/dev/null; echo '---ADBAPPSEP---'; media volume --stream 3 --get 2>/dev/null";
+
+async fn read_media_volume(serial: &str) -> Result<Option<(i32, i32)>, String> {
+    let result = adb::run_adb_for_serial(serial, &["shell", MEDIA_VOLUME_SCRIPT]).await?;
+    let mut parts = result.output.split("---ADBAPPSEP---");
+    Ok(resolve_media_volume(
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or(""),
+    ))
+}
+
 #[tauri::command]
 pub async fn get_media_volume(serial: String) -> Result<MediaVolumeState, String> {
     if crate::mock::enabled() {
         return Ok(crate::mock::media_volume());
     }
 
-    let current = adb::run_adb_for_serial(
-        &serial,
-        &["shell", "cmd", "audio", "get-stream-volume", "3"],
-    )
-    .await?;
-    let maximum =
-        adb::run_adb_for_serial(&serial, &["shell", "cmd", "audio", "get-max-volume", "3"]).await?;
-
-    Ok(MediaVolumeState {
-        level: last_integer(&current.output).unwrap_or(7),
-        maximum: last_integer(&maximum.output).unwrap_or(15).max(1),
-    })
+    let (level, maximum) = read_media_volume(&serial).await?.unwrap_or((7, 15));
+    Ok(MediaVolumeState { level, maximum })
 }
 
 #[tauri::command]
@@ -1659,6 +1663,7 @@ pub async fn get_control_state(serial: String) -> Result<ControlState, String> {
         settings get system screen_brightness 2>/dev/null; echo '---ADBAPPSEP---'; \
         cmd audio get-stream-volume 3 2>/dev/null; echo '---ADBAPPSEP---'; \
         cmd audio get-max-volume 3 2>/dev/null; echo '---ADBAPPSEP---'; \
+        media volume --stream 3 --get 2>/dev/null; echo '---ADBAPPSEP---'; \
         settings get system accelerometer_rotation 2>/dev/null; echo '---ADBAPPSEP---'; \
         settings get system user_rotation 2>/dev/null; echo '---ADBAPPSEP---'; \
         settings get global mode_ringer 2>/dev/null\
@@ -1673,10 +1678,13 @@ pub async fn get_control_state(serial: String) -> Result<ControlState, String> {
         .parse::<i32>()
         .unwrap_or(128)
         .clamp(0, 255);
-    let volume_level = last_integer(parts.next().unwrap_or("")).unwrap_or(7).max(0);
-    let volume_maximum = last_integer(parts.next().unwrap_or(""))
-        .unwrap_or(15)
-        .max(1);
+    let level_output = parts.next().unwrap_or("");
+    let max_output = parts.next().unwrap_or("");
+    let media_output = parts.next().unwrap_or("");
+    let (volume_level, volume_maximum) =
+        resolve_media_volume(level_output, max_output, media_output).unwrap_or((7, 15));
+    let volume_level = volume_level.max(0);
+    let volume_maximum = volume_maximum.max(1);
     let rotation_auto_value = last_output_line(parts.next().unwrap_or(""));
     let rotation = last_output_line(parts.next().unwrap_or(""))
         .parse::<i32>()
@@ -1707,9 +1715,10 @@ pub async fn set_media_volume(serial: String, volume: i32) -> Result<String, Str
         return Ok(format!("Media volume: {}", volume.clamp(0, 25)));
     }
 
-    let maximum =
-        adb::run_adb_for_serial(&serial, &["shell", "cmd", "audio", "get-max-volume", "3"]).await?;
-    let safe_volume = volume.clamp(0, last_integer(&maximum.output).unwrap_or(30).max(1));
+    let maximum = read_media_volume(&serial)
+        .await?
+        .map_or(30, |(_, maximum)| maximum.max(1));
+    let safe_volume = volume.clamp(0, maximum);
     let value = safe_volume.to_string();
     let commands: [&[&str]; 4] = [
         &["shell", "cmd", "audio", "set-volume", "3", &value],
@@ -1732,13 +1741,10 @@ pub async fn set_media_volume(serial: String, volume: i32) -> Result<String, Str
         let result = adb::run_adb_for_serial(&serial, command).await?;
         if result.ok() {
             if index == 0 {
-                let current = adb::run_adb_for_serial(
-                    &serial,
-                    &["shell", "cmd", "audio", "get-stream-volume", "3"],
-                )
-                .await?;
-                if last_integer(&current.output) != Some(safe_volume) {
-                    last_output = current.output;
+                // `cmd audio set-volume` can exit 0 without applying: verify, else try the next way.
+                let current = read_media_volume(&serial).await?;
+                if current.map(|(level, _)| level) != Some(safe_volume) {
+                    last_output = result.output;
                     continue;
                 }
             }
@@ -1882,16 +1888,35 @@ struct DaemonResponse {
 static PUSHED_DAEMONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
+/// One lock per device serial: concurrent callers (details, wallpaper, app list...) must not
+/// push the same helper jars at the same time.
+static DAEMON_PUSH_LOCKS: OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
 pub async fn push_daemons_if_needed(app: &tauri::AppHandle, serial: &str) -> Result<(), String> {
     use tauri::Manager;
     let daemons_cache =
         PUSHED_DAEMONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let session_pushed = {
-        let cache = daemons_cache.lock().unwrap();
-        cache.contains(serial)
+    let is_pushed = || {
+        daemons_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(serial)
     };
+    if is_pushed() {
+        return Ok(());
+    }
 
-    if session_pushed {
+    let device_lock = DAEMON_PUSH_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(serial.to_string())
+        .or_default()
+        .clone();
+    let _guard = device_lock.lock().await;
+    // Another caller may have finished the push while we were waiting for the lock.
+    if is_pushed() {
         return Ok(());
     }
 
@@ -1926,7 +1951,7 @@ pub async fn push_daemons_if_needed(app: &tauri::AppHandle, serial: &str) -> Res
             &["shell", "rm", "-f", "/data/local/tmp/info_apps*.jar"],
         )
         .await;
-        let _ = adb::run_adb_for_serial(
+        let pushed = adb::run_adb_for_serial(
             serial,
             &[
                 "push",
@@ -1934,7 +1959,13 @@ pub async fn push_daemons_if_needed(app: &tauri::AppHandle, serial: &str) -> Res
                 &info_apps_device,
             ],
         )
-        .await;
+        .await?;
+        if !pushed.ok() {
+            return Err(format!(
+                "Could not copy the helper to the device: {}",
+                pushed.output.trim()
+            ));
+        }
         let _ =
             adb::run_adb_for_serial(serial, &["shell", "chmod", "777", &info_apps_device]).await;
     }
@@ -1973,7 +2004,7 @@ pub async fn push_daemons_if_needed(app: &tauri::AppHandle, serial: &str) -> Res
             ],
         )
         .await;
-        let _ = adb::run_adb_for_serial(
+        let pushed = adb::run_adb_for_serial(
             serial,
             &[
                 "push",
@@ -1981,11 +2012,20 @@ pub async fn push_daemons_if_needed(app: &tauri::AppHandle, serial: &str) -> Res
                 &wallpaper_device,
             ],
         )
-        .await;
+        .await?;
+        if !pushed.ok() {
+            return Err(format!(
+                "Could not copy the helper to the device: {}",
+                pushed.output.trim()
+            ));
+        }
     }
 
-    let mut cache = daemons_cache.lock().unwrap();
-    cache.insert(serial.to_string());
+    // Only remembered once both helpers are really on the device, so a failed push is retried.
+    daemons_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(serial.to_string());
 
     Ok(())
 }
@@ -2003,6 +2043,9 @@ pub async fn enrich_app_summaries(
         return Ok(results);
     }
 
+    for request in &needs_daemon {
+        validate_android_name(&request.package_name)?;
+    }
     push_daemons_if_needed(&app, &serial).await?;
 
     let version = env!("CARGO_PKG_VERSION");
@@ -2047,14 +2090,16 @@ pub async fn enrich_app_summaries(
         daemon_output
     };
 
+    // A label with a raw control character (tab, CR...) makes the helper's JSON invalid for the
+    // whole batch; control characters are never meaningful in a label, so flatten them.
+    let clean_json: String = clean_json
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    // On failure every package stays "unresolved" (empty icon, nothing cached) and is retried
+    // later instead of being remembered as "no label, no icon".
     let parsed_responses: Vec<DaemonResponse> =
-        serde_json::from_str(clean_json).unwrap_or_else(|e| {
-            eprintln!(
-                "Failed to parse JSON array: {}. Output was: {}",
-                e, daemon_output
-            );
-            Vec::new()
-        });
+        serde_json::from_str(&clean_json).unwrap_or_default();
 
     let settings = read_settings();
     let cache_path = apps_json_path();
@@ -2075,11 +2120,13 @@ pub async fn enrich_app_summaries(
         let mut icon_data_url = String::new();
 
         // Find matching response
+        let mut resolved = false;
         if let Some(resp) = parsed_responses
             .iter()
             .find(|r| r.package.as_deref() == Some(&req.package_name))
         {
             if resp.error.is_none() {
+                resolved = true;
                 display_name = resp
                     .label
                     .clone()
@@ -2087,7 +2134,8 @@ pub async fn enrich_app_summaries(
                 icon_data_url = resp.icon.clone().unwrap_or_default();
             }
         }
-        let mut protocol_url = "none".to_string();
+        // Empty = unresolved (retry later); "none" = resolved but the app has no icon.
+        let mut protocol_url = if resolved { "none".to_string() } else { String::new() };
 
         if !icon_data_url.is_empty() {
             if settings.cache_enabled {
@@ -2108,7 +2156,7 @@ pub async fn enrich_app_summaries(
             }
         }
 
-        if settings.cache_enabled {
+        if settings.cache_enabled && resolved {
             cached_apps.insert(req.package_name.clone(), display_name.clone());
         }
 
@@ -2148,10 +2196,12 @@ pub async fn install_application_packages(
             tools::resolve_tool_path("adb").ok_or_else(|| "ADB is not available".to_string())?;
         let working_directory = install_working_dir()?;
         let mut log = Vec::new();
+        let mut any_failed = false;
 
         for file in files {
             let package_file = PathBuf::from(&file);
             if !package_file.is_file() {
+                any_failed = true;
                 log.push(format!(
                     "ERROR · Does not exist: {}",
                     package_file.display()
@@ -2197,29 +2247,40 @@ pub async fn install_application_packages(
                             },
                             output
                         )),
-                        Err(error) => log.push(format!(
-                            "ERROR · {}\n{}",
-                            package_file
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                            error
-                        )),
+                        Err(error) => {
+                            any_failed = true;
+                            log.push(format!(
+                                "ERROR · {}\n{}",
+                                package_file
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy(),
+                                error
+                            ))
+                        }
                     }
                 }
-                Err(error) => log.push(format!(
-                    "ERROR · {}\n{}",
-                    package_file
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    error
-                )),
+                Err(error) => {
+                    any_failed = true;
+                    log.push(format!(
+                        "ERROR · {}\n{}",
+                        package_file
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy(),
+                        error
+                    ))
+                }
             }
         }
         let _ = fs::remove_dir_all(&working_directory);
         invalidate_apps_cache(&serial);
-        Ok(log.join("\n\n"))
+        // The job queue turns `Ok` into a green "success": failures must come back as errors.
+        if any_failed {
+            Err(log.join("\n\n"))
+        } else {
+            Ok(log.join("\n\n"))
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2227,6 +2288,7 @@ pub async fn install_application_packages(
 
 #[tauri::command]
 pub async fn reinstall_app(serial: String, package_name: String) -> Result<String, String> {
+    validate_android_name(&package_name)?;
     let result = adb::run_adb_for_serial(
         &serial,
         &["shell", "cmd", "package", "install-existing", &package_name],
@@ -2245,6 +2307,7 @@ pub async fn get_app_details(
     serial: String,
     package_name: String,
 ) -> Result<AppDetailsInfo, String> {
+    validate_android_name(&package_name)?;
     let script = format!(
         "PKG='{pkg}'; \
          dumpsys package \"$PKG\"; \
@@ -2379,6 +2442,8 @@ pub async fn set_app_permission(
     permission_name: String,
     grant: bool,
 ) -> Result<String, String> {
+    validate_android_name(&package_name)?;
+    validate_android_name(&permission_name)?;
     let action = if grant { "grant" } else { "revoke" };
     let with_user_args = [
         "shell",
@@ -2453,54 +2518,107 @@ pub async fn list_directory(serial: String, path: String) -> Result<Vec<FileEntr
         return Err(result.output);
     }
 
-    let entries = result
-        .output
-        .lines()
-        .filter_map(|line| {
-            let parts = line.split_whitespace().collect::<Vec<_>>();
-            if parts.len() < 8 || !parts[0].starts_with(['d', '-', 'l']) {
-                return None;
+    Ok(result.stdout.lines().filter_map(parse_ls_line).collect())
+}
+
+fn is_ls_date(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+}
+
+fn is_ls_time(token: &str) -> bool {
+    let mut parts = token.split(':');
+    let valid = |part: Option<&str>| part.is_some_and(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit()));
+    let hours_minutes = valid(parts.next()) && valid(parts.next());
+    hours_minutes && parts.next().map_or(true, |seconds| valid(Some(seconds))) && parts.next().is_none()
+}
+
+/// Parses one line of `ls -la`, either from toybox (`drwxrwx--x 3 root sdcard_rw 4096 2024-05-01 10:00 Name`)
+/// or from the old toolbox of Android <= 5.1 (no link count, no size for directories).
+/// The name is sliced verbatim from the line, so repeated/leading spaces in file names survive.
+fn parse_ls_line(line: &str) -> Option<FileEntry> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let kind = line.chars().next()?;
+    if !matches!(kind, 'd' | '-' | 'l' | 'c' | 'b' | 'p' | 's') {
+        return None;
+    }
+
+    // Whitespace separated tokens with their byte ranges.
+    let mut tokens: Vec<(usize, usize)> = Vec::new();
+    let mut token_start = None;
+    for (index, character) in line.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                tokens.push((start, index));
             }
-            let raw_name = parts[7..].join(" ");
-            let (name, link_target) = if parts[0].starts_with('l') {
-                raw_name
-                    .split_once(" -> ")
-                    .map(|(name, target)| (name.to_string(), target.to_string()))
-                    .unwrap_or((raw_name, String::new()))
-            } else {
-                (raw_name, String::new())
-            };
-            if name == "." || name == ".." {
-                return None;
-            }
-            Some(FileEntry {
-                name,
-                permissions: parts[0].to_string(),
-                size: parts[4].parse().unwrap_or(0),
-                modified: format!("{} {}", parts[5], parts[6]),
-                is_directory: parts[0].starts_with('d'),
-                is_link: parts[0].starts_with('l'),
-                link_target,
-            })
-        })
-        .collect();
-    Ok(entries)
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
+    }
+    if let Some(start) = token_start {
+        tokens.push((start, line.len()));
+    }
+    let token = |index: usize| &line[tokens[index].0..tokens[index].1];
+
+    let date_index = (1..tokens.len().saturating_sub(1))
+        .find(|&index| is_ls_date(token(index)) && is_ls_time(token(index + 1)))?;
+    let rest = &line[tokens[date_index + 1].1..];
+    let raw_name = rest.strip_prefix(' ').unwrap_or(rest);
+    if raw_name.is_empty() {
+        return None;
+    }
+
+    let is_link = kind == 'l';
+    let (name, link_target) = if is_link {
+        raw_name
+            .split_once(" -> ")
+            .map(|(name, target)| (name.to_string(), target.to_string()))
+            .unwrap_or_else(|| (raw_name.to_string(), String::new()))
+    } else {
+        (raw_name.to_string(), String::new())
+    };
+    if name == "." || name == ".." {
+        return None;
+    }
+
+    // The size is the token before the date. Device nodes print `major, minor` instead, and
+    // directories of the old toolbox have no size at all (the token is then the group name).
+    let is_device_node = date_index >= 2 && token(date_index - 2).ends_with(',');
+    let size = if is_device_node {
+        0
+    } else {
+        token(date_index - 1).parse().unwrap_or(0)
+    };
+
+    Some(FileEntry {
+        name,
+        permissions: token(0).to_string(),
+        size,
+        modified: format!("{} {}", token(date_index), token(date_index + 1)),
+        is_directory: kind == 'd',
+        is_link,
+        link_target,
+    })
 }
 
 #[tauri::command]
 pub async fn read_file_bytes(serial: String, path: String) -> Result<tauri::ipc::Response, String> {
-    let adb_path =
-        tools::resolve_tool_path("adb").ok_or_else(|| "ADB is not available".to_string())?;
-
-    let output = crate::process::command(adb_path)
-        .args(["-s", &serial, "exec-out", "cat", &path])
-        .output()
-        .map_err(|e| format!("Failed to read file: {}", e))?;
-
-    if output.status.success() {
-        Ok(tauri::ipc::Response::new(output.stdout))
+    // `exec-out` goes through the device shell: the path must be quoted.
+    let result =
+        adb::run_adb_binary_detailed_for_serial(&serial, &["exec-out", "cat", &shell_quote(&path)])
+            .await?;
+    if result.exit_code == 0 {
+        Ok(tauri::ipc::Response::new(result.stdout))
+    } else if result.stderr.is_empty() {
+        Err("Failed to read file".to_string())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+        Err(result.stderr)
     }
 }
 
@@ -2521,7 +2639,7 @@ pub async fn pull_file(
 #[tauri::command]
 pub async fn get_file_thumbnail(serial: String, path: String) -> Result<String, String> {
     let (exit_code, bytes) =
-        adb::run_adb_binary_for_serial(&serial, &["exec-out", "cat", &path]).await?;
+        adb::run_adb_binary_for_serial(&serial, &["exec-out", "cat", &shell_quote(&path)]).await?;
     if exit_code != 0 {
         return Err("Could not get the thumbnail".to_string());
     }
@@ -2539,19 +2657,168 @@ pub async fn get_file_thumbnail(serial: String, path: String) -> Result<String, 
 }
 
 #[cfg(test)]
-mod wireless_tests {
+mod tests {
     use super::{
-        generate_wireless_qr, keyboard_package_name, parse_changeable_permissions,
-        parse_permissions,
+        apk_abi, apk_density, closest_density, is_blocked_open_extension, keyboard_package_name,
+        parse_changeable_permissions, parse_cmd_audio_value, parse_ls_line, parse_media_volume,
+        parse_permissions, parse_sideload_progress, preferred_abi, resolve_media_volume,
+        sanitize_local_file_name, shell_quote, validate_android_name, wallpaper_payload,
     };
     use std::collections::HashSet;
 
     #[test]
-    fn generates_hidden_credentials_and_scannable_qr() {
-        let qr = generate_wireless_qr().expect("QR generation should succeed");
-        assert!(qr.service_name.starts_with("adb-"));
-        assert_eq!(qr.password.len(), 12);
-        assert!(qr.qr_data.starts_with("WIFI:T:ADB;S:"));
+    fn parses_toybox_ls_lines() {
+        let dir = parse_ls_line("drwxrwx--x  3 root sdcard_rw 4096 2024-05-01 10:00 Android").unwrap();
+        assert!(dir.is_directory && !dir.is_link);
+        assert_eq!((dir.name.as_str(), dir.size, dir.modified.as_str()), ("Android", 4096, "2024-05-01 10:00"));
+
+        let file = parse_ls_line("-rw-rw----  1 u0_a1 media_rw 1234567 2024-05-01 10:00:05 My  Photo (1).jpg").unwrap();
+        assert!(!file.is_directory);
+        // Repeated spaces in the name must survive.
+        assert_eq!(file.name, "My  Photo (1).jpg");
+        assert_eq!(file.size, 1_234_567);
+
+        let link = parse_ls_line("lrwxrwxrwx  1 root root 21 2024-05-01 10:00 sdcard -> /storage/self/primary").unwrap();
+        assert!(link.is_link);
+        assert_eq!((link.name.as_str(), link.link_target.as_str()), ("sdcard", "/storage/self/primary"));
+    }
+
+    #[test]
+    fn parses_old_toolbox_and_device_node_ls_lines() {
+        // Android <= 5.1: no link count, and no size for directories.
+        let dir = parse_ls_line("drwxrwx--x root     sdcard_rw          2014-06-23 12:00 Android").unwrap();
+        assert!(dir.is_directory);
+        assert_eq!((dir.name.as_str(), dir.size), ("Android", 0));
+        let file = parse_ls_line("-rw-rw---- root     sdcard_rw     1234 2014-06-23 12:00 notes.txt").unwrap();
+        assert_eq!((file.name.as_str(), file.size), ("notes.txt", 1234));
+        // Device nodes print `major, minor` instead of a size.
+        let node = parse_ls_line("crw-rw-rw- 1 root root 1, 3 2024-05-01 10:00 null").unwrap();
+        assert_eq!((node.name.as_str(), node.size), ("null", 0));
+    }
+
+    #[test]
+    fn ignores_non_entry_ls_lines() {
+        assert!(parse_ls_line("total 24").is_none());
+        assert!(parse_ls_line("").is_none());
+        assert!(parse_ls_line("ls: /sdcard/x: No such file or directory").is_none());
+        assert!(parse_ls_line("drwxr-xr-x 2 root root 4096 2024-05-01 10:00 .").is_none());
+        assert!(parse_ls_line("drwxr-xr-x 2 root root 4096 2024-05-01 10:00 ..").is_none());
+    }
+
+    #[test]
+    fn extracts_the_wallpaper_payload_safely() {
+        assert_eq!(wallpaper_payload("noise\nWALLPAPER_START\nAAAA\nBBBB\nWALLPAPER_END\n").as_deref(), Some("AAAABBBB"));
+        // Markers in the wrong order or missing must not panic.
+        assert_eq!(wallpaper_payload("WALLPAPER_END xx WALLPAPER_START"), None);
+        assert_eq!(wallpaper_payload("WALLPAPER_STARTWALLPAPER_END"), None);
+        assert_eq!(wallpaper_payload("nothing here"), None);
+    }
+
+    #[test]
+    fn sanitizes_device_supplied_file_names() {
+        assert_eq!(sanitize_local_file_name("photo.jpg"), "photo.jpg");
+        assert_eq!(sanitize_local_file_name("..\\..\\Startup\\evil.bat"), "evil.bat");
+        assert_eq!(sanitize_local_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_local_file_name("a:b*c?.txt"), "a_b_c_.txt");
+        assert_eq!(sanitize_local_file_name("..."), "file");
+        assert_eq!(sanitize_local_file_name(""), "file");
+        assert!(sanitize_local_file_name(&"x".repeat(500)).len() <= 120);
+    }
+
+    #[test]
+    fn refuses_to_open_executable_types() {
+        for name in ["setup.exe", "run.BAT", "x.ps1", "a.lnk", "tool.jar", "s.sh", "m.msi"] {
+            assert!(is_blocked_open_extension(name), "{name}");
+        }
+        for name in ["photo.jpg", "notes.txt", "movie.mp4", "doc.pdf", "archive", "x.apk"] {
+            assert!(!is_blocked_open_extension(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn validates_android_names_and_quotes_shell_values() {
+        assert!(validate_android_name("com.example.app_1").is_ok());
+        for bad in ["", "a b", "a;b", "a'b", "$(id)", "a/b", "a\"b"] {
+            assert!(validate_android_name(bad).is_err(), "{bad}");
+        }
+        assert_eq!(shell_quote("/sdcard/My Photos/a (1).jpg"), "'/sdcard/My Photos/a (1).jpg'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn reads_media_volume_on_every_android_version() {
+        assert_eq!(parse_cmd_audio_value("AudioManager.getStreamVolume(3) -> 9"), Some(9));
+        assert_eq!(parse_cmd_audio_value("Unknown command: get-stream-volume"), None);
+        let media = "[v] Connecting to AudioService\n[v] volume is 7 in range [0..15]\n";
+        assert_eq!(parse_media_volume(media), Some((7, 15)));
+        // Android 16+: `cmd audio` answers.
+        assert_eq!(
+            resolve_media_volume("AudioManager.getStreamVolume(3) -> 4", "AudioManager.getStreamMaxVolume(3) -> 25", ""),
+            Some((4, 25))
+        );
+        // Android <= 15: `cmd audio` prints an error, `media volume` answers.
+        assert_eq!(
+            resolve_media_volume("Unknown command: get-stream-volume", "Unknown command: get-max-volume", media),
+            Some((7, 15))
+        );
+        assert_eq!(resolve_media_volume("", "", ""), None);
+    }
+
+    #[test]
+    fn parses_adb_sideload_progress_lines() {
+        assert_eq!(parse_sideload_progress("serving: 'ota.zip'  (~47%)    "), Some(47));
+        assert_eq!(parse_sideload_progress("serving: '/home/me/update (1).zip'  (~5%)"), Some(5));
+        assert_eq!(parse_sideload_progress("serving: 'a~b (~9%).zip'  (~100%)"), Some(100));
+        assert_eq!(parse_sideload_progress("serving: 'ota.zip'  (~250%)"), None);
+        assert_eq!(parse_sideload_progress("Total xfer: 1.00x"), None);
+        assert_eq!(parse_sideload_progress(""), None);
+    }
+
+    #[test]
+    fn density_splits_match_whole_tokens_only() {
+        // `hdpi` is a substring of the other qualifiers: it must not shadow them.
+        assert_eq!(apk_density("config.xxxhdpi.apk"), Some(640));
+        assert_eq!(apk_density("split_config.xxhdpi.apk"), Some(480));
+        assert_eq!(apk_density("config.xhdpi.apk"), Some(320));
+        assert_eq!(apk_density("config.hdpi.apk"), Some(240));
+        assert_eq!(apk_density("base-mdpi.apk"), Some(160));
+        assert_eq!(apk_density("config.ldpi.apk"), Some(120));
+        assert_eq!(apk_density("base.apk"), None);
+        assert_eq!(apk_density("config.fr.apk"), None);
+    }
+
+    #[test]
+    fn picks_the_closest_available_density() {
+        assert_eq!(closest_density(420, &[240, 320, 480]), Some(480));
+        assert_eq!(closest_density(300, &[240, 320, 480]), Some(320));
+        assert_eq!(closest_density(400, &[320, 480]), Some(480));
+        assert_eq!(closest_density(0, &[320]), None);
+        assert_eq!(closest_density(420, &[]), None);
+    }
+
+    #[test]
+    fn abi_splits_are_recognised_in_both_spellings() {
+        assert_eq!(apk_abi("split_config.arm64_v8a.apk").as_deref(), Some("arm64-v8a"));
+        assert_eq!(apk_abi("config.arm64-v8a.apk").as_deref(), Some("arm64-v8a"));
+        assert_eq!(apk_abi("config.armeabi_v7a.apk").as_deref(), Some("armeabi-v7a"));
+        assert_eq!(apk_abi("config.armeabi.apk").as_deref(), Some("armeabi"));
+        assert_eq!(apk_abi("config.x86_64.apk").as_deref(), Some("x86_64"));
+        assert_eq!(apk_abi("config.x86.apk").as_deref(), Some("x86"));
+        assert_eq!(apk_abi("com.example.x86tool.apk"), None);
+        assert_eq!(apk_abi("base.apk"), None);
+    }
+
+    #[test]
+    fn installs_only_the_preferred_abi_present_in_the_bundle() {
+        let device = vec!["arm64-v8a".to_string(), "armeabi-v7a".to_string(), "armeabi".to_string()];
+        let both = vec!["armeabi-v7a".to_string(), "arm64-v8a".to_string()];
+        assert_eq!(preferred_abi(&device, &both).as_deref(), Some("arm64-v8a"));
+        let only_v7 = vec!["armeabi-v7a".to_string()];
+        assert_eq!(preferred_abi(&device, &only_v7).as_deref(), Some("armeabi-v7a"));
+        let only_x86 = vec!["x86".to_string()];
+        assert_eq!(preferred_abi(&device, &only_x86), None);
+        let x86_64_device = vec!["x86_64".to_string(), "x86".to_string()];
+        assert_eq!(preferred_abi(&x86_64_device, &["x86_64".to_string()]).as_deref(), Some("x86_64"));
     }
 
     #[test]
@@ -2668,9 +2935,13 @@ pub fn launch_scrcpy(serial: String, extra_args: Vec<String>) -> Result<String, 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    command
+    let mut child = command
         .spawn()
         .map_err(|error| format!("Could not launch scrcpy: {error}"))?;
+    // Wait for it on a helper thread: an un-waited child stays defunct on Unix once it exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(format!("scrcpy launched for {serial}"))
 }
 
@@ -2751,6 +3022,7 @@ pub async fn export_apk(
     package_name: String,
     destination: String,
 ) -> Result<(), String> {
+    validate_android_name(&package_name)?;
     let paths_result =
         adb::run_adb_for_serial(&serial, &["shell", "pm", "path", &package_name]).await?;
     if !paths_result.ok() {
@@ -2888,6 +3160,43 @@ pub async fn get_home_details(serial: String) -> Result<HomeDetails, String> {
     })
 }
 
+/// File types the OS would run (or treat as active content) when "opened".
+const BLOCKED_OPEN_EXTENSIONS: &[&str] = &[
+    "exe", "com", "bat", "cmd", "msi", "msp", "scr", "pif", "cpl", "dll", "vbs", "vbe", "js",
+    "jse", "wsf", "wsh", "ps1", "psm1", "hta", "lnk", "url", "reg", "inf", "jar", "appx", "msix",
+    "app", "command", "sh", "desktop", "scf",
+];
+
+fn is_blocked_open_extension(file_name: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|extension| BLOCKED_OPEN_EXTENSIONS.contains(&extension.as_str()))
+}
+
+/// Reduces a device-supplied file name to a safe local one: last path component only,
+/// characters invalid on Windows replaced, no leading/trailing dots or spaces, bounded length.
+fn sanitize_local_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    let cleaned: String = cleaned.chars().take(120).collect();
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    }
+}
+
 #[tauri::command]
 pub async fn download_and_open_file(
     app: tauri::AppHandle,
@@ -2897,6 +3206,16 @@ pub async fn download_and_open_file(
 ) -> Result<String, String> {
     let temp_dir = crate::app_paths::cache_dir().join("temp");
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+    // The name comes from the device: keep only a plain file name (no `..\`, drive letters...) and
+    // never hand executable types to the OS "open" action.
+    let file_name = sanitize_local_file_name(&file_name);
+    if is_blocked_open_extension(&file_name) {
+        return Err(
+            "For your safety, executable files are not opened directly. Download the file and open it manually if you trust it."
+                .to_string(),
+        );
+    }
 
     // Generar un sufijo aleatorio para evitar conflictos de nombres
     let nonce: u32 = rand::random();
@@ -2999,6 +3318,7 @@ pub async fn get_app_storage_sizes(
         });
     }
 
+    validate_android_name(&package_name)?;
     push_daemons_if_needed(&app, &serial).await?;
 
     let version = env!("CARGO_PKG_VERSION");
@@ -3037,9 +3357,16 @@ pub async fn get_app_storage_sizes(
         serde_json::from_str(clean_json).unwrap_or_else(|_| Vec::new());
 
     if let Some(resp) = parsed_responses.first() {
+        let cache = resp.cacheSize.unwrap_or(-1);
+        // `StorageStats.getDataBytes()` includes the cache, which is reported separately.
+        let data = match resp.dataSize {
+            Some(data) if data >= 0 && cache >= 0 => (data - cache).max(0),
+            Some(data) => data,
+            None => -1,
+        };
         Ok(StorageSizes {
-            data_size_bytes: resp.dataSize.unwrap_or(-1),
-            cache_size_bytes: resp.cacheSize.unwrap_or(-1),
+            data_size_bytes: data,
+            cache_size_bytes: cache,
         })
     } else {
         Ok(StorageSizes {

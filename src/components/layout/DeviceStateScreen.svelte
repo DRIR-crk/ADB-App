@@ -6,10 +6,12 @@ import * as m from '../../paraglide/messages';
   let {
     serial,
     loading = false,
+    label,
     children
   } = $props<{
     serial: string | null;
     loading?: boolean;
+    label?: string;
     children?: import('svelte').Snippet;
   }>();
 </script>
@@ -27,7 +29,7 @@ import * as m from '../../paraglide/messages';
   {#if loading}
     <div class="device-state-screen loading overlay">
       <md-circular-progress indeterminate></md-circular-progress>
-      <strong>{m.wireless_connect_pending()}</strong>
+      <strong>{label ?? m.wireless_connect_pending()}</strong>
     </div>
   {/if}
 {/if}

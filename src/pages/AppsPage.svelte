@@ -21,7 +21,7 @@
   import { materialTextFieldValue } from "../actions/materialTextFieldValue";
   import { appTone, formatBytes, translateError } from "./workbench/utils";
   import VirtualGrid from "../components/VirtualGrid.svelte";
-  import { getDebloatInfo } from "../utils/debloat";
+  import { getDebloatInfo } from "../utils/debloat.svelte";
   let {
     serial,
     status = $bindable(),
@@ -36,19 +36,30 @@
     tab: string;
   }>();
 
+  // Cleared when this instance is destroyed so in-flight work stops writing the bound status
+  let alive = true;
+  $effect(() => () => {
+    alive = false;
+  });
+  let appsRequestId = 0;
+  let detailsRequestId = 0;
+
   async function runQuiet(args: string[]) {
     try {
       return await invoke<string>("run_device_action", { serial, args });
     } catch (error: any) {
-      status = translateError(error);
+      if (alive) status = translateError(error);
       return undefined;
     }
   }
 
   let apps = $state.raw<AppSummary[]>([]);
+  let appsLoaded = $state(false);
+  let listLoading = $state(false);
   let appDetails = $state.raw<AppDetailsInfo | null>(null);
   let metadataLoading = $state(false);
   let attemptedMetadata = $state(false);
+  let failedMetadata = $state.raw<Set<string>>(new Set());
   let detailsLoading = $state(false);
   let apkmirrorUrl = $state<string | null>(null);
   let apkmirrorSearched = $state(false);
@@ -83,19 +94,33 @@
     }
   }
 
-  let filteredApps = $derived.by(() => {
-    let result = apps;
-    if (filter === "user") result = result.filter((app) => !app.system_app);
-    if (filter === "system") result = result.filter((app) => app.system_app);
-    if (filter === "disabled") result = result.filter((app) => app.disabled && !app.uninstalled);
-    if (filter === "uninstalled") result = result.filter((app) => app.uninstalled);
-    if (filter === "debloat") {
-      result = result.filter((app) => {
-        if (!app.system_app || app.disabled || app.uninstalled) return false;
-        const info = getDebloatInfo(app.package_name);
-        return info !== undefined;
-      });
+  // Rust marks apps without an extractable icon with the sentinel "none"
+  const hasIcon = (url?: string) => !!url && url !== "none";
+
+  function matchesFilter(app: AppSummary, value: typeof filter) {
+    switch (value) {
+      case "user":
+        return !app.system_app;
+      case "system":
+        return app.system_app;
+      case "disabled":
+        return app.disabled && !app.uninstalled;
+      case "uninstalled":
+        return app.uninstalled;
+      case "debloat":
+        return (
+          app.system_app &&
+          !app.disabled &&
+          !app.uninstalled &&
+          getDebloatInfo(app.package_name) !== undefined
+        );
+      default:
+        return true;
     }
+  }
+
+  let filteredApps = $derived.by(() => {
+    let result = apps.filter((app) => matchesFilter(app, filter));
     if (appFilter) {
       const lower = appFilter.toLowerCase();
       result = result.filter(
@@ -120,25 +145,53 @@
   );
 
   async function refreshApps(forceRefresh = false) {
-    if (!serial) return;
-    busy = true;
+    if (!serial) return false;
+    const requestId = ++appsRequestId;
+    listLoading = true;
     attemptedMetadata = false;
+    if (forceRefresh) failedMetadata = new Set();
     try {
       const value = await invoke<AppSummary[]>("list_apps", {
         serial,
         forceRefresh,
       });
+      if (!alive || requestId !== appsRequestId) return false;
       apps = value;
+      appsLoaded = true;
       status = "";
+      return true;
     } catch (error) {
-      status = String(error);
+      if (alive && requestId === appsRequestId) status = String(error);
+      return false;
     } finally {
-      busy = false;
+      if (requestId === appsRequestId) listLoading = false;
     }
   }
 
   $effect(() => {
-    if (tab === "apps" && serial && !apps.length) refreshApps();
+    if (tab === "apps" && serial && !appsLoaded) refreshApps();
+  });
+
+  // Reload the list once an install job for this device finishes successfully
+  let seenInstallJobs: Set<string> | undefined;
+  $effect(() => {
+    const succeeded = operationsState.jobs
+      .filter(
+        (job) =>
+          job.type === "install" &&
+          job.serial === serial &&
+          job.status === "success",
+      )
+      .map((job) => job.id);
+    const seen = seenInstallJobs;
+    if (!seen) {
+      seenInstallJobs = new Set(succeeded);
+      return;
+    }
+    const fresh = succeeded.filter((id) => !seen.has(id));
+    if (!fresh.length) return;
+    for (const id of fresh) seen.add(id);
+    refreshApps(true);
   });
 
   $effect(() => {
@@ -165,12 +218,14 @@
     showLoading = true,
   ) {
     if (!serial || !packageName) return;
+    const requestId = ++detailsRequestId;
     if (showLoading) detailsLoading = true;
     try {
       const value = await invoke<AppDetailsInfo>("get_app_details", {
         serial,
         packageName,
       });
+      if (!alive) return;
       const summary = apps.find((app) => app.package_name === packageName);
 
       appDetails =
@@ -213,9 +268,11 @@
         })
         .catch(() => {});
     } catch (error) {
-      status = String(error);
+      if (alive) status = String(error);
     } finally {
-      if (showLoading) detailsLoading = false;
+      // Only the latest request may clear the loader, otherwise a slow older
+      // request would reveal the placeholder of the app selected afterwards
+      if (requestId === detailsRequestId) detailsLoading = false;
     }
   }
 
@@ -264,13 +321,14 @@
   async function loadVisibleMetadata() {
     if (!serial || !appsNeedingMetadata.length || metadataLoading) return;
     metadataLoading = true;
-    let loaded = 0;
     let failed = 0;
+    let completed = true;
     const currentFilter = filter;
     const snapshot = [...appsNeedingMetadata];
     try {
       for (let start = 0; start < snapshot.length; start += 200) {
-        if (filter !== currentFilter || tab !== "apps") {
+        if (!alive || filter !== currentFilter || tab !== "apps") {
+          completed = false;
           break;
         }
         const batch = snapshot.slice(start, start + 200);
@@ -285,12 +343,35 @@
           })),
         }).catch(() => []);
 
-        loaded += summaries.length;
-        failed += batch.length - summaries.length;
+        if (!alive) {
+          completed = false;
+          break;
+        }
+        const summaryMap = new Map(summaries.map((s) => [s.package_name, s]));
+        // Whatever is still missing after this attempt is not retried again this session
+        const unresolved = batch.filter(
+          (app) => !summaryMap.get(app.package_name)?.icon_data_url,
+        );
+        if (unresolved.length) {
+          failed += unresolved.length;
+          failedMetadata = new Set([
+            ...failedMetadata,
+            ...unresolved.map((app) => app.package_name),
+          ]);
+        }
 
         if (summaries.length > 0) {
-          const summaryMap = new Map(summaries.map((s) => [s.package_name, s]));
-          apps = apps.map((app) => summaryMap.get(app.package_name) || app);
+          // Merge only what the daemon produced: the flags in the snapshot may be stale by now
+          apps = apps.map((app) => {
+            const summary = summaryMap.get(app.package_name);
+            return summary
+              ? {
+                  ...app,
+                  display_name: summary.display_name,
+                  icon_data_url: summary.icon_data_url,
+                }
+              : app;
+          });
 
           if (appDetails) {
             const summary = summaryMap.get(appDetails.package_name);
@@ -305,8 +386,15 @@
         }
 
       }
-      if (tab === "apps") {
-        status = failed ? m.workbench_status_metadataFailed({ failed }) : "";
+      if (alive && completed) {
+        // Names are known now: apply the same ordering list_apps uses on later loads
+        const key = (app: AppSummary) => app.display_name.toLowerCase();
+        apps = [...apps].sort((a, b) =>
+          key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0,
+        );
+      }
+      if (alive && failed) {
+        status = m.workbench_status_metadataFailed({ failed });
       }
     } finally {
       metadataLoading = false;
@@ -321,7 +409,7 @@
         directory: false,
         filters: [
           {
-            name: "Android Packages",
+            name: m.apps_file_filter_android(),
             extensions: ["apk", "apks", "apkm", "xapk", "zip", "aab"],
           },
         ],
@@ -435,28 +523,7 @@
         ),
       };
     }
-    try {
-      if (permission.name === "android.permission.REQUEST_INSTALL_PACKAGES") {
-        const result = await runQuiet([
-          "shell",
-          "appops",
-          "set",
-          selectedPackage,
-          "REQUEST_INSTALL_PACKAGES",
-          nextGranted ? "allow" : "deny",
-        ]);
-        if (result === undefined) throw new Error("Command failed");
-      } else {
-        await invoke<string>("set_app_permission", {
-          serial,
-          packageName: selectedPackage,
-          permissionName: permission.name,
-          grant: nextGranted,
-        });
-      }
-      await refreshAppDetails(selectedPackage, false);
-    } catch (error) {
-      status = String(error);
+    const revert = () => {
       if (appDetails) {
         appDetails = {
           ...appDetails,
@@ -467,6 +534,34 @@
           ),
         };
       }
+    };
+    try {
+      if (permission.name === "android.permission.REQUEST_INSTALL_PACKAGES") {
+        const result = await runQuiet([
+          "shell",
+          "appops",
+          "set",
+          selectedPackage,
+          "REQUEST_INSTALL_PACKAGES",
+          nextGranted ? "allow" : "deny",
+        ]);
+        if (result === undefined) {
+          // runQuiet already put the device error in the status
+          revert();
+          return;
+        }
+      } else {
+        await invoke<string>("set_app_permission", {
+          serial,
+          packageName: selectedPackage,
+          permissionName: permission.name,
+          grant: nextGranted,
+        });
+      }
+      await refreshAppDetails(selectedPackage, false);
+    } catch (error) {
+      if (alive) status = String(error);
+      revert();
     } finally {
       const next = { ...permissionUpdating };
       delete next[permission.name];
@@ -482,7 +577,7 @@
       const destination = await save({
         title: m.apps_action_saveApk(),
         defaultPath: `${appDetails.package_name}.${extension}`,
-        filters: [{ name: "Android Package", extensions: [extension] }],
+        filters: [{ name: m.apps_file_filter_android(), extensions: [extension] }],
       });
       if (destination) {
         status = m.workbench_status_exporting({ path: destination });
@@ -491,10 +586,10 @@
           packageName: appDetails.package_name,
           destination,
         });
-        status = m.workbench_status_apkSaved({ path: destination });
+        if (alive) status = m.workbench_status_apkSaved({ path: destination });
       }
     } catch (error) {
-      status = String(error);
+      if (alive) status = String(error);
     }
   }
 
@@ -525,35 +620,45 @@
     ]);
   }
 
+  // pm/adb report some failures as "Failure [...]" / "Failed" text; runQuiet returns undefined on a non-zero exit
+  function reportedFailure(output: string | undefined) {
+    if (output === undefined) return true;
+    if (/^Fail(ure|ed)\b/m.test(output)) {
+      status = output;
+      return true;
+    }
+    return false;
+  }
+
   async function performDestructiveAppAction() {
     if (!destructiveAction || !selectedPackage) return;
     destructiveBusy = true;
     try {
       if (destructiveAction === "uninstall") {
-        if (appDetails?.system_app) {
-          await runQuiet([
-            "shell",
-            "pm",
-            "uninstall",
-            "-k",
-            "--user",
-            "0",
-            selectedPackage,
-          ]);
-        } else {
-          await runQuiet(["uninstall", selectedPackage]);
-        }
-        status = m.workbench_status_appUninstalled();
+        const result = appDetails?.system_app
+          ? await runQuiet([
+              "shell",
+              "pm",
+              "uninstall",
+              "-k",
+              "--user",
+              "0",
+              selectedPackage,
+            ])
+          : await runQuiet(["uninstall", selectedPackage]);
+        if (reportedFailure(result)) return;
         selectedPackage = "";
         appDetails = null;
-        await refreshApps(true);
+        if (await refreshApps(true)) status = m.workbench_status_appUninstalled();
       } else {
-        await runQuiet(["shell", "pm", "clear", selectedPackage]);
+        const result = await runQuiet(["shell", "pm", "clear", selectedPackage]);
+        if (reportedFailure(result)) return;
         status = m.workbench_status_appDataCleared();
         await refreshAppDetails();
       }
-      destructiveAction = null;
     } finally {
+      // Close the dialog in every case so the status message (success or error) is visible
+      destructiveAction = null;
       destructiveBusy = false;
     }
   }
@@ -599,26 +704,13 @@
   ]);
 
   let appsNeedingMetadata = $derived(
-    apps.filter((app) => !app.icon_data_url),
+    apps.filter(
+      (app) => !app.icon_data_url && !failedMetadata.has(app.package_name),
+    ),
   );
-  const count = (value: string) =>
-    apps.filter((app) =>
-      value === "all"
-        ? true
-        : value === "disabled"
-          ? app.disabled && !app.uninstalled
-          : value === "uninstalled"
-            ? app.uninstalled
-            : value === "system"
-              ? app.system_app && !app.disabled && !app.uninstalled
-              : value === "debloat"
-                ? (() => {
-                    if (!app.system_app || app.disabled || app.uninstalled) return false;
-                  const info = getDebloatInfo(app.package_name);
-                  return info && (info.removal === "delete" || info.removal === "replace" || info.removal === "caution");
-                })()
-              : !app.system_app && !app.disabled && !app.uninstalled,
-    ).length;
+  // Same predicate as the grid so the badge always matches the visible tiles
+  const count = (value: typeof filter) =>
+    apps.filter((app) => matchesFilter(app, value)).length;
 
   $effect(() => {
     let unlisten: (() => void) | undefined;
@@ -684,9 +776,13 @@
         <md-icon-button
           aria-label={m.apps_action_refresh()}
           title={m.apps_action_refresh()}
+          disabled={listLoading || undefined}
           onclick={() => refreshApps(true)}
         >
-          <MaterialIcon name="refresh" />
+          <MaterialIcon
+            name="refresh"
+            class={listLoading ? "apps-material-spin" : ""}
+          />
         </md-icon-button>
         <md-filled-icon-button
           aria-label={m.apps_action_install()}
@@ -715,8 +811,16 @@
         <button
           class="apps-material-tile {selectedPackage === app.package_name ? 'selected' : ''}"
           style="width: 100%; height: 100%; position: relative;"
-          onclick={() => selectApplication(app)}
-          ondblclick={() => openAppInScrcpy(app.package_name)}
+          onclick={(event) => {
+            // The second click of a double-click must not toggle the selection away
+            if (event.detail > 1) return;
+            selectApplication(app);
+          }}
+          ondblclick={() => {
+            // The first click of the double-click may have toggled an already selected app off.
+            if (selectedPackage !== app.package_name) selectApplication(app);
+            openAppInScrcpy(app.package_name);
+          }}
         >
           <div
             class="apps-material-status-icon {app.uninstalled ? 'uninstalled' : app.disabled ? 'disabled' : ''}"
@@ -725,7 +829,7 @@
             <MaterialIcon name={app.uninstalled ? "delete" : app.disabled ? "block" : app.system_app ? "settings" : "person"} />
           </div>
           <span class="app-icon-frame">
-            {#if app.icon_data_url}
+            {#if hasIcon(app.icon_data_url)}
               <img src={app.icon_data_url} alt="" decoding="async" />
             {:else}
               <span class="app-fallback {appTone(app.package_name)}">{app.display_name.slice(0, 2).toUpperCase()}</span>
@@ -743,7 +847,11 @@
         class="apps-material-grid-container"
         style="flex: 1; min-height: 0; padding: 12px; box-sizing: border-box; position: relative;"
       >
-        {#if filter === "debloat"}
+        {#if listLoading && !apps.length}
+          <div class="apps-material-section-loader" style="height: 100%">
+            <md-circular-progress indeterminate></md-circular-progress>
+          </div>
+        {:else if filter === "debloat"}
           <div class="debloat-grouped-view" style="display: flex; flex-direction: column; gap: 24px; padding-bottom: 24px; overflow-y: auto; height: 100%; padding-right: 4px;">
             {#each ["delete", "replace", "caution", "unsafe"] as rType}
               {@const groupApps = filteredApps.filter(a => getDebloatInfo(a.package_name)?.removal === rType)}
@@ -816,7 +924,7 @@
 
         <header class="apps-material-detail__hero" style="position: relative">
           <span class="app-icon-frame">
-            {#if appDetails.icon_data_url}
+            {#if hasIcon(appDetails.icon_data_url)}
               <img src={appDetails.icon_data_url} alt="" />
             {:else}
               <span class="app-fallback {appTone(appDetails.package_name)}"
@@ -981,10 +1089,7 @@
               <MaterialIcon slot="icon" name="download" />
               {m.apps_action_saveApk()}
             </md-filled-tonal-button>
-            <md-filled-tonal-button
-              onclick={openApkMirror}
-              disabled={!apkmirrorSearched || undefined}
-            >
+            <md-filled-tonal-button onclick={openApkMirror}>
               <MaterialIcon
                 slot="icon"
                 name={apkmirrorUrl ? "public" : "search"}
@@ -1155,7 +1260,9 @@
       action={destructiveAction}
       appName={appDetails?.display_name || selectedPackage}
       packageName={selectedPackage}
-      iconDataUrl={appDetails?.icon_data_url || ""}
+      iconDataUrl={appDetails && hasIcon(appDetails.icon_data_url)
+        ? appDetails.icon_data_url
+        : ""}
       busy={destructiveBusy}
       onClose={() => (destructiveAction = null)}
       onConfirm={performDestructiveAppAction}

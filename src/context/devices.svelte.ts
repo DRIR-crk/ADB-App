@@ -40,6 +40,10 @@ export interface DeviceDetails {
   total_storage_mb: number;
   used_storage_mb: number;
   dark_mode_enabled: boolean;
+  window_animation_scale: number;
+  transition_animation_scale: number;
+  animator_duration_scale: number;
+  font_scale: number;
   screen_off_timeout_ms: number;
   uptime_seconds: number;
 }
@@ -58,6 +62,10 @@ export interface HomeIdentity {
   serial: string;
   deviceName: string;
   carrierName: string;
+}
+
+export function isWirelessSerial(serial: string): boolean {
+  return serial.includes(':') || serial.includes('._tcp') || serial.startsWith('adb-');
 }
 
 class DeviceState {
@@ -82,6 +90,7 @@ class DeviceState {
   #runtimeRequestId = 0;
   #wallpaperRequestId = 0;
   #wallpaperSerial: string | null = null;
+  #wallpaperFailedSerial: string | null = null;
   #homeDetailsCache = new Map<string, DeviceDetails>();
   #homeIdentityCache = new Map<string, HomeIdentity>();
 
@@ -198,6 +207,7 @@ class DeviceState {
         if (!samePhysicalDevice) this.wallpaperImage = null;
       }
 
+      if (reconnected) this.#wallpaperFailedSerial = null;
       if (reconnected || !this.deviceDetails) {
         this.connectionRevision++;
         this.operationalLoading = true;
@@ -227,7 +237,7 @@ class DeviceState {
   }
 
   #isWireless(serial: string) {
-    return serial.includes(':') || serial.includes('._tcp') || serial.startsWith('adb-');
+    return isWirelessSerial(serial);
   }
 
   #sameDeviceIdentity(left: Device, right: Device) {
@@ -332,6 +342,7 @@ class DeviceState {
     this.homeIdentity = this.#homeIdentityCache.get(serial) ?? null;
     this.#wallpaperRequestId++;
     this.#wallpaperSerial = null;
+    this.#wallpaperFailedSerial = null;
     this.wallpaperImage = null;
     this.screenshot = null;
     this.loading = true;
@@ -355,6 +366,9 @@ class DeviceState {
   async loadWallpaper(serial: string) {
     if (!serial || this.selectedDevice?.serial !== serial) return;
     if (this.wallpaperImage || (this.wallpaperLoading && this.#wallpaperSerial === serial)) return;
+    // The extractor already failed for this serial; retry only after a reconnect or explicit selection
+    // (every device-list-changed event would otherwise re-run it on the device).
+    if (this.#wallpaperFailedSerial === serial) return;
 
     const requestId = ++this.#wallpaperRequestId;
     this.#wallpaperSerial = serial;
@@ -368,6 +382,7 @@ class DeviceState {
     } catch {
       if (requestId === this.#wallpaperRequestId && this.selectedDevice?.serial === serial) {
         this.wallpaperImage = null;
+        this.#wallpaperFailedSerial = serial;
       }
     } finally {
       if (requestId === this.#wallpaperRequestId) {

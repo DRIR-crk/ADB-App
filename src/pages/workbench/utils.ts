@@ -1,21 +1,14 @@
 import * as m from '../../paraglide/messages';
-import deviceDb from '../../assets/device-db.json';
+import { lookupMarketingName } from '../../context/deviceDb.svelte';
 
+/** Marketing name of a device model; '' until the (lazily loaded) database is ready or if unknown. */
 export function getMarketingName(model: string, brand?: string): string {
   if (!model) return '';
-  if (brand && (deviceDb as any)[brand]) {
-    const name = (deviceDb as any)[brand][model];
-    if (name) return `${brand} ${name}`;
-  }
-  for (const [dbBrand, models] of Object.entries(deviceDb)) {
-    const name = (models as any)[model];
-    if (name) return `${dbBrand} ${name}`;
-  }
-  return '';
+  return lookupMarketingName(model, brand);
 }
 
 export const words = (value: string) =>
-  value.match(/(?:[^\s"]+|"[^"]*")+/g)?.map(part => part.replace(/^"|"$/g, '')) ?? [];
+  value.match(/(?:[^\s"]+|"[^"]*")+/g)?.map(part => part.replace(/"([^"]*)"/g, '$1')) ?? [];
 
 function gcd(left: number, right: number): number {
   let a = Math.abs(left);

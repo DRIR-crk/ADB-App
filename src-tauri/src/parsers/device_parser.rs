@@ -33,7 +33,20 @@ pub fn parse_devices(output: &str) -> Vec<Device> {
         }
 
         let mut state_idx = 0;
-        let valid_states = ["device", "offline", "unauthorized", "recovery", "bootloader", "sideload", "host", "connecting"];
+        // Every single-word connection state adb prints; `no permissions` is handled below.
+        let valid_states = [
+            "device",
+            "offline",
+            "unauthorized",
+            "authorizing",
+            "recovery",
+            "rescue",
+            "bootloader",
+            "sideload",
+            "host",
+            "connecting",
+            "detached",
+        ];
 
         for (i, part) in parts.iter().enumerate().skip(1) {
             if valid_states.contains(part) {
@@ -689,7 +702,89 @@ fn safe_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_memory;
+    use super::{parse_devices, parse_memory};
+
+    #[test]
+    fn parses_usb_device_with_long_listing_properties() {
+        let output = "List of devices attached\n\
+            0A4312B01795714827     device usb:1-4 product:frankel model:Pixel_10 device:frankel transport_id:3\n\n";
+
+        let devices = parse_devices(output);
+
+        assert_eq!(devices.len(), 1);
+        let device = &devices[0];
+        assert_eq!(device.serial, "0A4312B01795714827");
+        assert_eq!(device.state, "device");
+        assert_eq!(device.product, "frankel");
+        assert_eq!(device.model, "Pixel_10");
+        assert_eq!(device.device, "frankel");
+        assert_eq!(device.transport_id, "3");
+    }
+
+    #[test]
+    fn parses_wireless_serials_and_intermediate_states() {
+        let output = "List of devices attached\n\
+            adb-0A4312B01795714827-AbCdEf._adb-tls-connect._tcp device product:frankel model:Pixel_10 device:frankel transport_id:5\n\
+            192.168.1.20:5555      offline transport_id:6\n\
+            emulator-5554          unauthorized transport_id:7\n\
+            R58M12ABCDE            authorizing transport_id:8\n\
+            0123456789ABCDEF       rescue transport_id:9\n\
+            FEDCBA9876543210       detached transport_id:10\n";
+
+        let devices = parse_devices(output);
+
+        let states: Vec<(&str, &str)> = devices
+            .iter()
+            .map(|device| (device.serial.as_str(), device.state.as_str()))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("adb-0A4312B01795714827-AbCdEf._adb-tls-connect._tcp", "device"),
+                ("192.168.1.20:5555", "offline"),
+                ("emulator-5554", "unauthorized"),
+                ("R58M12ABCDE", "authorizing"),
+                ("0123456789ABCDEF", "rescue"),
+                ("FEDCBA9876543210", "detached"),
+            ]
+        );
+        assert_eq!(devices[0].model, "Pixel_10");
+        assert_eq!(devices[0].transport_id, "5");
+    }
+
+    #[test]
+    fn parses_no_permissions_state_with_reason() {
+        let output = "List of devices attached\n\
+            0A4312B01795714827     no permissions (user in plugdev group; are you root?); see [http://developer.android.com/tools/device.html]\n";
+
+        let devices = parse_devices(output);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].serial, "0A4312B01795714827");
+        assert_eq!(devices[0].state, "no permissions");
+    }
+
+    #[test]
+    fn ignores_daemon_noise_and_windows_line_endings() {
+        let output = "* daemon not running; starting now at tcp:5037\r\n\
+            * daemon started successfully\r\n\
+            List of devices attached\r\n\
+            0A4312B01795714827     device product:frankel model:Pixel_10 device:frankel transport_id:1\r\n\r\n";
+
+        let devices = parse_devices(output);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].serial, "0A4312B01795714827");
+        assert_eq!(devices[0].state, "device");
+        assert_eq!(devices[0].model, "Pixel_10");
+        assert_eq!(devices[0].transport_id, "1");
+    }
+
+    #[test]
+    fn returns_no_devices_without_the_list_header() {
+        assert!(parse_devices("adb: failed to check server version: cannot connect to daemon\n").is_empty());
+        assert!(parse_devices("").is_empty());
+    }
 
     #[test]
     fn calculates_android_used_memory_from_total_and_free_ram() {

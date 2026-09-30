@@ -1,12 +1,12 @@
 use std::fs;
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
+#[cfg(not(store_build))]
+use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use flate2::read::GzDecoder;
 
-#[cfg(unix)]
-use crate::tools::managed_executable;
 use crate::tools::{executable_name, managed_dir};
 
 #[cfg(not(store_build))]
@@ -18,8 +18,10 @@ enum ArchiveKind {
 
 #[cfg(not(store_build))]
 fn client() -> Result<reqwest::Client, String> {
+    // Per-phase timeouts instead of one total deadline, so big downloads finish on slow links.
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(20))
+        .read_timeout(Duration::from_secs(60))
         .build()
         .map_err(|error| error.to_string())
 }
@@ -134,9 +136,16 @@ fn extract(bytes: &[u8], kind: ArchiveKind, destination: &Path) -> Result<(), St
                     }
                     io::copy(
                         &mut entry,
-                        &mut fs::File::create(output).map_err(|error| error.to_string())?,
+                        &mut fs::File::create(&output).map_err(|error| error.to_string())?,
                     )
                     .map_err(|error| error.to_string())?;
+                    // Keep the Unix mode bits (executables) recorded in the archive.
+                    #[cfg(unix)]
+                    if let Some(mode) = entry.unix_mode() {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&output, fs::Permissions::from_mode(mode & 0o777))
+                            .map_err(|error| error.to_string())?;
+                    }
                 }
             }
         }
@@ -176,57 +185,213 @@ fn remove_dir(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(store_build))]
-fn move_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<(), String> {
-    fs::create_dir_all(&dst).map_err(|error| error.to_string())?;
-    for entry in fs::read_dir(src).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let ty = entry.file_type().map_err(|error| error.to_string())?;
-        let dst_path = dst.as_ref().join(entry.file_name());
-        if ty.is_dir() {
-            move_dir_all(entry.path(), dst_path)?;
-        } else {
-            let _ = fs::remove_file(&dst_path);
-            fs::rename(entry.path(), &dst_path).map_err(|error| error.to_string())?;
+const SWAP_ATTEMPTS: usize = 12;
+#[cfg(not(store_build))]
+const SWAP_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Errors Windows reports while a process that is shutting down still holds a file open
+/// (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION).
+#[cfg(not(store_build))]
+fn is_transient_lock(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+        || matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// `fs::rename` across volumes: ERROR_NOT_SAME_DEVICE (17) on Windows, EXDEV (18) elsewhere.
+#[cfg(not(store_build))]
+fn is_cross_device(error: &io::Error) -> bool {
+    let code = if cfg!(windows) { 17 } else { 18 };
+    error.kind() == io::ErrorKind::CrossesDevices || error.raw_os_error() == Some(code)
+}
+
+/// `fs::rename` that retries briefly on Windows: the adb server that was just killed may still
+/// be releasing `adb.exe` / `AdbWinApi.dll` when the swap starts.
+#[cfg(not(store_build))]
+fn rename_with_retries(from: &Path, to: &Path) -> io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows) && attempt < SWAP_ATTEMPTS && is_transient_lock(&error) =>
+            {
+                attempt += 1;
+                std::thread::sleep(SWAP_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
         }
     }
+}
+
+/// Moves one file, copying it when `from` and `to` live on different volumes.
+#[cfg(not(store_build))]
+fn move_file(from: &Path, to: &Path) -> Result<(), String> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(error) if is_cross_device(&error) => {
+            fs::copy(from, to).map_err(|error| {
+                format!("Could not copy {} to {}: {error}", from.display(), to.display())
+            })?;
+            fs::remove_file(from).map_err(|error| {
+                format!("Could not remove {} after copying it: {error}", from.display())
+            })
+        }
+        Err(error) => Err(format!(
+            "Could not move {} to {}: {error}",
+            from.display(),
+            to.display()
+        )),
+    }
+}
+
+/// Moves the tree at `src` to `dst` (which must not exist yet). Renames the whole directory when
+/// possible and falls back to a file-by-file move across volumes; no failure is skipped.
+#[cfg(not(store_build))]
+fn move_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    match fs::rename(src, dst) {
+        Ok(()) => return Ok(()),
+        Err(error) if is_cross_device(&error) => {}
+        Err(error) => {
+            return Err(format!(
+                "Could not move {} to {}: {error}",
+                src.display(),
+                dst.display()
+            ))
+        }
+    }
+    fs::create_dir_all(dst).map_err(|error| format!("{}: {error}", dst.display()))?;
+    for entry in fs::read_dir(src).map_err(|error| format!("{}: {error}", src.display()))? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            move_tree(&from, &to)?;
+        } else {
+            move_file(&from, &to)?;
+        }
+    }
+    fs::remove_dir(src).map_err(|error| format!("Could not remove {}: {error}", src.display()))
+}
+
+/// Sibling directory that keeps the previous installation while the new one is moved in place.
+#[cfg(not(store_build))]
+fn backup_dir(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tool".to_string());
+    target.with_file_name(format!("{name}.previous"))
+}
+
+/// Replaces `target` with the verified tree at `extracted_root`, restoring the previous
+/// installation if anything goes wrong so the user never ends up with a half-installed tool.
+#[cfg(not(store_build))]
+fn swap_into_place(extracted_root: &Path, target: &Path) -> Result<(), String> {
+    let backup = backup_dir(target);
+    remove_dir(&backup)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let had_previous = target.exists();
+    if had_previous {
+        rename_with_retries(target, &backup).map_err(|error| {
+            format!(
+                "Could not replace the current installation in {} (is it still in use?): {error}",
+                target.display()
+            )
+        })?;
+    }
+    if let Err(error) = move_tree(extracted_root, target) {
+        let mut message = error;
+        if let Err(cleanup) = remove_dir(target) {
+            message.push_str(&format!(
+                " (cleanup of {} failed: {cleanup})",
+                target.display()
+            ));
+        }
+        if had_previous {
+            if let Err(restore) = rename_with_retries(&backup, target) {
+                message.push_str(&format!(
+                    ". Restoring the previous version failed too ({restore}); it was kept in {}",
+                    backup.display()
+                ));
+            }
+        }
+        return Err(message);
+    }
+    if had_previous {
+        // Best effort: a leftover backup is removed at the start of the next install.
+        let _ = remove_dir(&backup);
+    }
+    Ok(())
+}
+
+#[cfg(all(not(store_build), unix))]
+fn ensure_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    fs::set_permissions(path, permissions).map_err(|error| error.to_string())
+}
+
+#[cfg(all(not(store_build), not(unix)))]
+fn ensure_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(store_build)]
-pub async fn install_tool(_tool: &str, _custom_target: Option<PathBuf>) -> Result<(), String> {
+pub async fn install_tool(_tool: &str) -> Result<(), String> {
     Err("La versión de la tienda no soporta descargas.".to_string())
 }
 
+/// Downloads `tool` and installs it into its managed directory (never into the directory of a
+/// system or third-party copy). The archive is unpacked and verified in a staging directory
+/// first; only then is the installed copy swapped, with rollback on failure.
 #[cfg(not(store_build))]
-pub async fn install_tool(tool: &str, custom_target: Option<PathBuf>) -> Result<(), String> {
+pub async fn install_tool(tool: &str) -> Result<(), String> {
     let client = client()?;
     let (url, kind) = tool_asset(tool, &client).await?;
-    let target = custom_target.unwrap_or_else(|| managed_dir(tool));
+    let target = managed_dir(tool);
     let staging = crate::app_paths::cache_dir().join("temp").join(tool);
     remove_dir(&staging)?;
-    {
-        let archive = download_bytes(&client, &url).await?;
-        extract(&archive, kind, &staging)?;
-        drop(archive);
-    }
-    let executable = find_file(&staging, &executable_name(tool))
-        .ok_or_else(|| format!("The download does not contain {}", executable_name(tool)))?;
+    let archive = download_bytes(&client, &url).await?;
+
+    let executable = {
+        let staging = staging.clone();
+        let name = executable_name(tool);
+        tauri::async_runtime::spawn_blocking(move || -> Result<PathBuf, String> {
+            extract(&archive, kind, &staging)?;
+            let executable = find_file(&staging, &name)
+                .ok_or_else(|| format!("The download does not contain {name}"))?;
+            // Zip entries created on Windows carry no Unix mode: make sure the tool can run.
+            ensure_executable(&executable)?;
+            Ok(executable)
+        })
+        .await
+        .map_err(|error| error.to_string())??
+    };
     let extracted_root = executable.parent().unwrap_or(&staging).to_path_buf();
-    fs::create_dir_all(&target).map_err(|error| error.to_string())?;
-    move_dir_all(&extracted_root, &target)?;
-    if staging != target {
-        remove_dir(&staging)?;
+
+    // A running adb server and the device tracker's adb client keep adb.exe / AdbWinApi.dll
+    // locked on Windows, and the tracker would restart the server right after kill-server.
+    let stops_adb = tool == "adb"
+        || crate::tools::resolve_tool_path("adb").is_some_and(|path| path.starts_with(&target));
+    let _tracker_pause = stops_adb.then(crate::adb::TrackerPause::new);
+    if stops_adb {
+        let _ = crate::adb::kill_server().await;
+        // Give the server (and the tracker client being killed) a moment to release the files.
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let installed = managed_executable(tool);
-        let mut permissions = fs::metadata(&installed)
-            .map_err(|error| error.to_string())?
-            .permissions();
-        permissions.set_mode(permissions.mode() | 0o111);
-        fs::set_permissions(installed, permissions).map_err(|error| error.to_string())?;
-    }
-    Ok(())
+
+    tauri::async_runtime::spawn_blocking(move || swap_into_place(&extracted_root, &target))
+        .await
+        .map_err(|error| error.to_string())??;
+    remove_dir(&staging)
 }
 

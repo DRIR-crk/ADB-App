@@ -36,7 +36,7 @@ Our goal is to provide a powerful, lightweight, and straightforward tool to mana
 - **Apps Manager:** Install, uninstall, debloat, disable, and extract APKs. Reveal hidden permissions and double-click any app to launch it right from your PC.
 - **File Explorer:** A fully-featured file manager to transfer content between your PC and your Android device. It supports drag-and-drop, permission changes, renaming, folder creation, audio and image previews, double click to open files and search.
 - **System Settings:** Visually manage advanced options like installed keyboards (IME), secondary users, gesture navigation, and system-level permissions.
-- **Wireless Connection:** Built-in wizard for Wi-Fi pairing (Android 11+), QR code scanning, and seamless switching from USB to wireless debugging.
+- **Wireless Connection:** Built-in wizard for Wi-Fi pairing (Android 11+). Phones that open *Pair device with pairing code* are detected automatically on your network (you only type the 6-digit code), QR code pairing, manual IP:port, automatic connection after pairing, and seamless switching from USB to wireless debugging.
 
 *Navigate between tabs using `Ctrl+Tab`. Features full Dark Mode, system theme sync, and comes localized in both English and Spanish.*
 

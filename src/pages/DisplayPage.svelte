@@ -9,7 +9,7 @@ import * as m from '../paraglide/messages';
   import MaterialIcon from '../components/MaterialIcon.svelte';
   import { materialTextFieldValue } from '../actions/materialTextFieldValue';
   
-  import { formatRate } from './workbench/utils';
+  import { formatRate, translateError } from './workbench/utils';
   import { invoke } from '@tauri-apps/api/core';
   let {
     details = $bindable(),
@@ -25,7 +25,8 @@ import * as m from '../paraglide/messages';
     onToggleDarkMode,
     onSetRefreshRate,
     onReset,
-    onApply
+    onApply,
+    status = $bindable()
   } = $props<{
     details: DeviceDetails | null;
     width: number;
@@ -41,9 +42,10 @@ import * as m from '../paraglide/messages';
     onSetRefreshRate: (rate: number) => void;
     onReset: () => void;
     onApply: () => void;
+    status: string;
   }>();
 
-  let canApply = $derived(Boolean(details && width && height && density && timeout));
+  let canApply = $derived(Boolean(details) && [width, height, density, timeout].every(value => Number.isInteger(value) && value > 0));
   let currentAnimationScale = $state(1.0);
 
   let currentFontScale = $state(1.0);
@@ -59,20 +61,32 @@ import * as m from '../paraglide/messages';
     if (!details || !serial) return;
     if (currentAnimationScale === speed) return;
 
+    const previous = currentAnimationScale;
     currentAnimationScale = speed;
 
     const s = String(speed);
-    await invoke('run_device_action', { serial, args: ['shell', 'settings', 'put', 'global', 'window_animation_scale', s] });
-    await invoke('run_device_action', { serial, args: ['shell', 'settings', 'put', 'global', 'transition_animation_scale', s] });
-    await invoke('run_device_action', { serial, args: ['shell', 'settings', 'put', 'global', 'animator_duration_scale', s] });
+    try {
+      await invoke('run_device_action', { serial, args: ['shell', 'settings', 'put', 'global', 'window_animation_scale', s] });
+      await invoke('run_device_action', { serial, args: ['shell', 'settings', 'put', 'global', 'transition_animation_scale', s] });
+      await invoke('run_device_action', { serial, args: ['shell', 'settings', 'put', 'global', 'animator_duration_scale', s] });
+    } catch (error) {
+      currentAnimationScale = previous;
+      status = translateError(error);
+    }
   }
 
   async function applyFontScale(scale: number) {
     if (!details || !serial) return;
     const num = Number(scale);
     if (currentFontScale === num) return;
+    const previous = currentFontScale;
     currentFontScale = num;
-    await invoke('run_device_action', { serial, args: ['shell', 'settings', 'put', 'system', 'font_scale', String(num)] });
+    try {
+      await invoke('run_device_action', { serial, args: ['shell', 'settings', 'put', 'system', 'font_scale', String(num)] });
+    } catch (error) {
+      currentFontScale = previous;
+      status = translateError(error);
+    }
   }
 
 </script>

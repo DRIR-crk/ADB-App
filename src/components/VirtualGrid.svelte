@@ -7,7 +7,8 @@
     minItemWidth = '100%', 
     gap = 0, 
     key,
-    row 
+    row,
+    resetKey = undefined
   } = $props<{
     items: T[];
     itemHeight: number;
@@ -15,6 +16,8 @@
     gap?: number;
     key?: (item: T) => string | number;
     row: Snippet<[T, number]>;
+    /** Cuando cambia, el scroll vuelve al principio (p. ej. al cambiar de carpeta). */
+    resetKey?: unknown;
   }>();
 
   let containerElement: HTMLElement | undefined = $state();
@@ -59,6 +62,28 @@
       });
     }
     return result;
+  });
+
+  /** Desplaza el contenedor lo justo para que el elemento `index` quede visible y sincroniza el estado. */
+  export function scrollToIndex(index: number) {
+    if (!containerElement) return;
+    const rowTop = Math.floor(Math.max(0, index) / columns) * (itemHeight + gap);
+    const rowBottom = rowTop + itemHeight;
+    const viewTop = containerElement.scrollTop;
+    const viewHeight = containerElement.clientHeight;
+    let next = viewTop;
+    if (rowTop < viewTop) next = rowTop;
+    else if (rowBottom > viewTop + viewHeight) next = rowBottom - viewHeight;
+    if (next !== viewTop) containerElement.scrollTop = next;
+    scrollTop = containerElement.scrollTop;
+  }
+
+  $effect(() => {
+    void resetKey;
+    if (containerElement && containerElement.scrollTop !== 0) {
+      containerElement.scrollTop = 0;
+      scrollTop = 0;
+    }
   });
 
   let ticking = false;

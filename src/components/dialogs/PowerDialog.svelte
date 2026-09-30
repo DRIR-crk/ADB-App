@@ -92,17 +92,17 @@ import * as m from '../../paraglide/messages';
         <span><strong>{m.power_advanced_title()}</strong></span>
       </div>
       
-      <md-outlined-button disabled={busy ? true : undefined} onclick={() => requestAction('Recovery', 'health_and_safety', ['reboot', 'recovery'], m.power_hint_recovery(), true)}>
+      <md-outlined-button disabled={busy ? true : undefined} onclick={() => requestAction(m.power_btn_recovery(), 'health_and_safety', ['reboot', 'recovery'], m.power_hint_recovery(), true)}>
         <span slot="icon"><MaterialIcon name="health_and_safety" /></span>
         {m.power_btn_recovery()}
       </md-outlined-button>
       
-      <md-outlined-button disabled={busy ? true : undefined} onclick={() => requestAction('Bootloader', 'developer_board', ['reboot', 'bootloader'], m.power_hint_bootloader(), true)}>
+      <md-outlined-button disabled={busy ? true : undefined} onclick={() => requestAction(m.power_btn_bootloader(), 'developer_board', ['reboot', 'bootloader'], m.power_hint_bootloader(), true)}>
         <span slot="icon"><MaterialIcon name="developer_board" /></span>
         {m.power_btn_bootloader()}
       </md-outlined-button>
       
-      <md-outlined-button disabled={busy ? true : undefined} onclick={() => requestAction('Fastbootd', 'terminal', ['reboot', 'fastboot'], m.power_hint_fastbootd(), true)}>
+      <md-outlined-button disabled={busy ? true : undefined} onclick={() => requestAction(m.power_btn_fastbootd(), 'terminal', ['reboot', 'fastboot'], m.power_hint_fastbootd(), true)}>
         <span slot="icon"><MaterialIcon name="terminal" /></span>
         {m.power_btn_fastbootd()}
       </md-outlined-button>
